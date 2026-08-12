@@ -1,6 +1,9 @@
 import { createGalaxyInitialState } from "./galaxyPhysics";
 import { createAllPairsSolver } from "./galaxyAllPairsSolver";
-import { createBarnesHutSolver } from "./galaxyBarnesHutSolver";
+import {
+  chooseTreeDepth,
+  createBarnesHutSolver,
+} from "./galaxyBarnesHutSolver";
 import {
   createBufferWithData,
   createStorageBuffer,
@@ -29,6 +32,8 @@ export type GalaxySolverAccuracy = {
   maximumRelativeError: number;
   momentumResidual: number;
   torqueResidual: number;
+  treeDepth: number | null;
+  traversalOverflow: boolean;
 };
 
 const factories: Record<GalaxySolverKind, GalaxySolverFactory> = {
@@ -76,19 +81,24 @@ const exactAcceleration = (
 const percentile = (sorted: number[], fraction: number) =>
   sorted[Math.min(sorted.length - 1, Math.floor(fraction * sorted.length))] ?? 0;
 
-const sampleIndices = (particleCount: number, core2Index: number) => {
+const sampleIndices = (
+  particleCount: number,
+  core2Index: number,
+  sampleTargets: number,
+) => {
   const indices = new Set<number>([0, core2Index]);
-  const stride = particleCount / Math.max(1, SAMPLE_TARGETS - indices.size);
-  for (let sample = 0; sample < SAMPLE_TARGETS; sample++) {
+  const stride = particleCount / Math.max(1, sampleTargets - indices.size);
+  for (let sample = 0; sample < sampleTargets; sample++) {
     indices.add(Math.min(particleCount - 1, Math.floor(sample * stride)));
   }
-  return [...indices].sort((left, right) => left - right).slice(0, SAMPLE_TARGETS);
+  return [...indices].sort((left, right) => left - right).slice(0, sampleTargets);
 };
 
 export const runGalaxySolverAccuracy = async (
   device: GPUDevice,
   solverKind: GalaxySolverKind,
   textureWidth = 56,
+  sampleTargets = SAMPLE_TARGETS,
 ): Promise<GalaxySolverAccuracy> => {
   const initial = createGalaxyInitialState({
     textureWidth,
@@ -156,6 +166,7 @@ export const runGalaxySolverAccuracy = async (
   const indices = sampleIndices(
     initial.parameters.particleCount,
     initial.parameters.core2Index,
+    Math.max(2, Math.min(initial.parameters.particleCount, sampleTargets)),
   );
   const relativeErrors: number[] = [];
   let squaredError = 0;
@@ -239,5 +250,11 @@ export const runGalaxySolverAccuracy = async (
     maximumRelativeError: relativeErrors.at(-1) ?? 0,
     momentumResidual: magnitude(weightedForce) / Math.max(weightedForceMagnitude, 1e-20),
     torqueResidual: magnitude(weightedTorque) / Math.max(weightedTorqueMagnitude, 1e-20),
+    treeDepth: solverKind === "barnes-hut"
+      ? chooseTreeDepth(initial.parameters.particleCount)
+      : null,
+    traversalOverflow: approximate.some(
+      (value, index) => index % 4 === 3 && value !== 0,
+    ),
   };
 };

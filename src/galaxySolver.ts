@@ -1,4 +1,8 @@
-import type { GalaxyInitialState } from "./galaxyPhysics";
+import {
+  sanitizeGalaxySettings,
+  type GalaxyInitialState,
+  type GalaxySettings,
+} from "./galaxyPhysics";
 
 export type GalaxySolverKind = "all-pairs" | "barnes-hut";
 
@@ -22,6 +26,23 @@ export const GALAXY_SOLVERS: Record<GalaxySolverKind, GalaxySolverDefinition> = 
     description: "Compact occupied-node linear octree",
     maxTextureWidth: 1024,
   },
+};
+
+// Sanitize once at the engine boundary, then apply the selected solver's
+// capacity. This prevents NaN or injected custom-event values from reaching
+// memory preflight, allocation, camera framing, or initialization.
+export const sanitizeGalaxySettingsForSolver = (
+  settings: GalaxySettings,
+  solver: GalaxySolverKind,
+) => {
+  const sanitized = sanitizeGalaxySettings(settings);
+  return {
+    ...sanitized,
+    textureWidth: Math.min(
+      sanitized.textureWidth,
+      GALAXY_SOLVERS[solver].maxTextureWidth,
+    ),
+  };
 };
 
 export type GalaxySolverInstance = {

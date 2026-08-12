@@ -9,6 +9,11 @@ const TREE_NODE_STRIDE = 32;
 const TREE_CHILD_STRIDE = 32;
 const MINIMUM_TREE_HALF_EXTENT = 128;
 const TOPOLOGY_DISPATCH_BYTES = 24;
+// A depth-first octree walk retains at most one chosen child plus seven siblings
+// per level. Depth ten needs exactly 71 entries, avoiding the occupancy cost
+// of the former undersized or overly conservative private allocations.
+export const BARNES_HUT_TRAVERSAL_STACK_CAPACITY = 71;
+export const maximumTraversalStackEntries = (depth: number) => 1 + 7 * depth;
 
 // Deeper trees keep terminal buckets small as resolution rises. Ten levels
 // map directly to a 30-bit Morton-style cell coordinate at million-body scale.
@@ -278,7 +283,6 @@ fn aggregateTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
   var mass = 0.0;
   var moment = vec3f(0.0);
   var softeningMoment = 0.0;
-  var particleCount = 0u;
 
   if (level == TREE_DEPTH) {
     var sourceIndex = atomicLoad(&leafHeads[nodeIndex]);
@@ -286,7 +290,6 @@ fn aggregateTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
       if (sourceIndex == EMPTY) { break; }
       let source = particles[sourceIndex];
       if (source.positionMass.w > 0.0) {
-        particleCount++;
         mass += source.positionMass.w;
         moment += source.positionMass.w * source.positionMass.xyz;
         softeningMoment += source.positionMass.w * source.velocitySoftening.w *
@@ -309,11 +312,8 @@ fn aggregateTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
   nodes[nodeIndex].momentY = moment.y;
   nodes[nodeIndex].momentZ = moment.z;
   nodes[nodeIndex].softeningMoment = softeningMoment;
-  // Parent links are only needed while constructing the topology. Reuse the
-  // field afterward to expose terminal occupancy to the traversal shader.
-  if (level == TREE_DEPTH) {
-    nodes[nodeIndex].parent = particleCount;
-  }
+  // Keep parent links intact for topology diagnostics and future traversal
+  // variants; terminal occupancy is represented by the exact linked list.
 }
 
 `;
@@ -553,10 +553,11 @@ fn calculateTreeForces(@builtin(global_invocation_id) globalId: vec3u) {
 
   let halfExtent = treeHalfExtent();
   let targetCell = targetLeaf(targetParticle.positionMass.xyz, halfExtent);
-  var stack: array<u32, 64>;
+  var stack: array<u32, ${BARNES_HUT_TRAVERSAL_STACK_CAPACITY}>;
   var stackSize = 1u;
   stack[0] = 0u;
   var acceleration = vec3f(0.0);
+  var traversalOverflow = false;
 
   loop {
     if (stackSize == 0u) { break; }
@@ -596,13 +597,23 @@ fn calculateTreeForces(@builtin(global_invocation_id) globalId: vec3u) {
     }
     for (var reverseSlot = 8u; reverseSlot > 0u; reverseSlot--) {
       let child = nodeChildren[current * 8u + reverseSlot - 1u];
-      if (child != EMPTY && stackSize < 64u) {
-        stack[stackSize] = child;
-        stackSize++;
+      if (child != EMPTY) {
+        if (stackSize < ${BARNES_HUT_TRAVERSAL_STACK_CAPACITY}u) {
+          stack[stackSize] = child;
+          stackSize++;
+        } else {
+          traversalOverflow = true;
+        }
       }
     }
   }
-  accelerations[targetIndex] = vec4f(acceleration, 0.0);
+  // The fourth acceleration lane is otherwise unused. Test readbacks scan it
+  // so any future depth/capacity mismatch is explicit without another storage
+  // binding or an atomic in the production force loop.
+  accelerations[targetIndex] = vec4f(
+    acceleration,
+    select(0.0, 1.0, traversalOverflow),
+  );
 }
 `;
 
@@ -919,4 +930,5 @@ export const BARNES_HUT_TEST_CONSTANTS = {
   minimumHalfExtent: MINIMUM_TREE_HALF_EXTENT,
   nodeStride: TREE_NODE_STRIDE,
   childStride: TREE_CHILD_STRIDE,
+  traversalStackCapacity: BARNES_HUT_TRAVERSAL_STACK_CAPACITY,
 } as const;

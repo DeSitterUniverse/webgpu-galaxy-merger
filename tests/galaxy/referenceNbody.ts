@@ -201,3 +201,100 @@ export const componentShape = (
     rmsHeight: Math.sqrt(heightSquared / count),
   };
 };
+
+// Measure a disk in its own instantaneous angular-momentum frame. This keeps
+// the diagnostic valid after initialization tilts the galaxy in world space.
+export const diskHeatingDiagnostics = (
+  system: ReferenceSystem,
+  predicate: (metadata: number) => boolean,
+) => {
+  let totalMass = 0;
+  const center = [0, 0, 0];
+  const bulk = [0, 0, 0];
+  for (let index = 0; index < system.count; index++) {
+    if (!predicate(system.metadata[index]!)) continue;
+    const mass = system.masses[index]!;
+    const offset = index * 3;
+    totalMass += mass;
+    for (let axis = 0; axis < 3; axis++) {
+      center[axis] = center[axis]! + mass * system.positions[offset + axis]!;
+      bulk[axis] = bulk[axis]! + mass * system.velocities[offset + axis]!;
+    }
+  }
+  for (let axis = 0; axis < 3; axis++) {
+    center[axis] = center[axis]! / totalMass;
+    bulk[axis] = bulk[axis]! / totalMass;
+  }
+  const angularMomentum = [0, 0, 0];
+  for (let index = 0; index < system.count; index++) {
+    if (!predicate(system.metadata[index]!)) continue;
+    const offset = index * 3;
+    const mass = system.masses[index]!;
+    const x = system.positions[offset]! - center[0]!;
+    const y = system.positions[offset + 1]! - center[1]!;
+    const z = system.positions[offset + 2]! - center[2]!;
+    const vx = system.velocities[offset]! - bulk[0]!;
+    const vy = system.velocities[offset + 1]! - bulk[1]!;
+    const vz = system.velocities[offset + 2]! - bulk[2]!;
+    angularMomentum[0] = angularMomentum[0]! + mass * (y * vz - z * vy);
+    angularMomentum[1] = angularMomentum[1]! + mass * (z * vx - x * vz);
+    angularMomentum[2] = angularMomentum[2]! + mass * (x * vy - y * vx);
+  }
+  const angularMagnitude = Math.max(Math.hypot(...angularMomentum), 1e-20);
+  const normal = angularMomentum.map((value) => value / angularMagnitude);
+  let heightSquared = 0;
+  let radialVelocitySquared = 0;
+  let verticalVelocitySquared = 0;
+  let tangentialSpeed = 0;
+  let measuredMass = 0;
+  for (let index = 0; index < system.count; index++) {
+    if (!predicate(system.metadata[index]!)) continue;
+    const offset = index * 3;
+    const mass = system.masses[index]!;
+    const position = [
+      system.positions[offset]! - center[0]!,
+      system.positions[offset + 1]! - center[1]!,
+      system.positions[offset + 2]! - center[2]!,
+    ];
+    const velocity = [
+      system.velocities[offset]! - bulk[0]!,
+      system.velocities[offset + 1]! - bulk[1]!,
+      system.velocities[offset + 2]! - bulk[2]!,
+    ];
+    const height = position.reduce(
+      (sum, value, axis) => sum + value * normal[axis]!,
+      0,
+    );
+    const planar = position.map((value, axis) => value - height * normal[axis]!);
+    const planarRadius = Math.max(Math.hypot(...planar), 1e-20);
+    const radial = planar.map((value) => value / planarRadius);
+    const tangential = [
+      normal[1]! * radial[2]! - normal[2]! * radial[1]!,
+      normal[2]! * radial[0]! - normal[0]! * radial[2]!,
+      normal[0]! * radial[1]! - normal[1]! * radial[0]!,
+    ];
+    const radialVelocity = velocity.reduce(
+      (sum, value, axis) => sum + value * radial[axis]!,
+      0,
+    );
+    const verticalVelocity = velocity.reduce(
+      (sum, value, axis) => sum + value * normal[axis]!,
+      0,
+    );
+    const localTangentialSpeed = velocity.reduce(
+      (sum, value, axis) => sum + value * tangential[axis]!,
+      0,
+    );
+    measuredMass += mass;
+    heightSquared += mass * height * height;
+    radialVelocitySquared += mass * radialVelocity * radialVelocity;
+    verticalVelocitySquared += mass * verticalVelocity * verticalVelocity;
+    tangentialSpeed += mass * localTangentialSpeed;
+  }
+  return {
+    rmsHeight: Math.sqrt(heightSquared / measuredMass),
+    radialVelocityDispersion: Math.sqrt(radialVelocitySquared / measuredMass),
+    verticalVelocityDispersion: Math.sqrt(verticalVelocitySquared / measuredMass),
+    meanTangentialSpeed: tangentialSpeed / measuredMass,
+  };
+};

@@ -6,6 +6,7 @@ import {
 } from "../../src/galaxyPhysics";
 import {
   componentShape,
+  diskHeatingDiagnostics,
   diagnostics,
   evolveReference,
   isolatedFirstGalaxy,
@@ -115,4 +116,47 @@ describe("isolated live galaxy validation", () => {
     expect(after.virialRatio).toBeGreaterThan(0.75);
     expect(after.virialRatio).toBeLessThan(1.25);
   });
+
+  it("quantifies live-halo disk heating at two particle resolutions", () => {
+    const results = [56, 72].map((textureWidth) => {
+      const initial = createGalaxyInitialState({
+        textureWidth,
+        radius: 35,
+        offset: 25,
+      });
+      const system = isolatedFirstGalaxy(initial);
+      const disk = (metadata: number) =>
+        (metadata & (META_CORE | META_HALO)) === 0;
+      const before = diskHeatingDiagnostics(system, disk);
+      evolveReference(system, initial.parameters.timeStep, 128);
+      const after = diskHeatingDiagnostics(system, disk);
+      return {
+        textureWidth,
+        diskParticles: initial.parameters.diskParticlesPerGalaxy,
+        haloParticles: initial.parameters.haloParticlesPerGalaxy,
+        heightGrowth: relativeChange(before.rmsHeight, after.rmsHeight),
+        radialHeating: relativeChange(
+          before.radialVelocityDispersion,
+          after.radialVelocityDispersion,
+        ),
+        verticalHeating: relativeChange(
+          before.verticalVelocityDispersion,
+          after.verticalVelocityDispersion,
+        ),
+        before,
+        after,
+      };
+    });
+
+    console.info("galaxy-test live-halo disk heating", results);
+
+    for (const result of results) {
+      expect(result.heightGrowth).toBeLessThan(0.4);
+      expect(result.radialHeating).toBeLessThan(0.55);
+      expect(result.verticalHeating).toBeLessThan(0.55);
+    }
+    // Resolution-aware softening and lighter halo particles should prevent the
+    // higher-resolution realization from heating substantially more quickly.
+    expect(results[1]!.radialHeating).toBeLessThan(results[0]!.radialHeating + 0.12);
+  }, 30_000);
 });

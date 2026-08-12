@@ -411,6 +411,11 @@ type EquilibriumModel = {
   diskCumulative: Float64Array;
   haloCumulative: Float64Array;
   diskAcceleration: Float64Array;
+  diskSurfaceDensity: Float64Array;
+  diskRadialDispersion: Float64Array;
+  diskTangentialDispersion: Float64Array;
+  diskVerticalDispersion: Float64Array;
+  diskMeanStreaming: Float64Array;
   haloDispersionSquared: Float64Array;
   escapeSpeed: Float64Array;
   innerOrbitalPeriod: number;
@@ -419,6 +424,7 @@ type EquilibriumModel = {
 const RADIAL_TABLE_SIZE = 257;
 const DISK_RING_COUNT = 160;
 const DISK_AZIMUTH_SAMPLES = 64;
+const DISK_TOOMRE_Q = 1.5;
 const equilibriumModelCache = new Map<string, EquilibriumModel>();
 
 const cosineTaper = (radius: number, start: number, end: number) => {
@@ -549,6 +555,115 @@ const buildEquilibriumModel = (parameters: GalaxyParameters) => {
     diskAcceleration[target] = Math.max(0, acceleration);
   }
 
+  // Build a warm axisymmetric disk from the same tapered surface density and
+  // flattened force table used above. The radial dispersion targets constant
+  // Toomre Q, the tangential dispersion follows the epicyclic approximation,
+  // and the mean streaming speed includes the radial Jeans asymmetric drift.
+  const diskSurfaceDensity = new Float64Array(RADIAL_TABLE_SIZE);
+  const diskTotalAcceleration = new Float64Array(RADIAL_TABLE_SIZE);
+  const omegaSquared = new Float64Array(RADIAL_TABLE_SIZE);
+  const epicyclicFrequency = new Float64Array(RADIAL_TABLE_SIZE);
+  const diskRadialDispersion = new Float64Array(RADIAL_TABLE_SIZE);
+  const diskTangentialDispersion = new Float64Array(RADIAL_TABLE_SIZE);
+  const diskVerticalDispersion = new Float64Array(RADIAL_TABLE_SIZE);
+  const diskMeanStreaming = new Float64Array(RADIAL_TABLE_SIZE);
+  const verticalScaleHeight = parameters.radius * 0.035;
+  for (let index = 1; index < RADIAL_TABLE_SIZE; index++) {
+    const radius = radii[index]!;
+    const taper = cosineTaper(
+      radius,
+      parameters.radius * 0.82,
+      parameters.radius,
+    );
+    diskSurfaceDensity[index] = radius >= diskMinimum
+      ? DISK_MASS * Math.exp(-radius / diskScale) * taper /
+        (2 * Math.PI * diskNormalization)
+      : 0;
+    const coreAcceleration = GRAVITY * CORE_MASS * radius /
+      (radius * radius + symmetricSofteningSquared(
+        parameters.diskSoftening,
+        parameters.coreSoftening,
+      )) ** 1.5;
+    const haloAcceleration = GRAVITY * HALO_MASS *
+      haloCumulative[index]! * radius /
+      (radius * radius + symmetricSofteningSquared(
+        parameters.diskSoftening,
+        parameters.haloSoftening,
+      )) ** 1.5;
+    diskTotalAcceleration[index] =
+      diskAcceleration[index]! + coreAcceleration + haloAcceleration;
+    omegaSquared[index] = diskTotalAcceleration[index]! / radius;
+  }
+  omegaSquared[0] = omegaSquared[1]!;
+  for (let index = 1; index < RADIAL_TABLE_SIZE - 1; index++) {
+    const derivative = (
+      omegaSquared[index + 1]! - omegaSquared[index - 1]!
+    ) / (2 * spacing);
+    epicyclicFrequency[index] = Math.sqrt(Math.max(
+      radii[index]! * derivative + 4 * omegaSquared[index]!,
+      Number.EPSILON,
+    ));
+  }
+  epicyclicFrequency[0] = epicyclicFrequency[1]!;
+  epicyclicFrequency[RADIAL_TABLE_SIZE - 1] =
+    epicyclicFrequency[RADIAL_TABLE_SIZE - 2]!;
+  for (let index = 1; index < RADIAL_TABLE_SIZE; index++) {
+    const radius = radii[index]!;
+    const circularSpeed = Math.sqrt(Math.max(
+      diskTotalAcceleration[index]! * radius,
+      0,
+    ));
+    const qDispersion = 3.36 * GRAVITY * diskSurfaceDensity[index]! *
+      DISK_TOOMRE_Q / Math.max(epicyclicFrequency[index]!, 1e-8);
+    diskRadialDispersion[index] = clamp(
+      qDispersion,
+      circularSpeed * 0.025,
+      circularSpeed * 0.28,
+    );
+    const omega = Math.sqrt(Math.max(omegaSquared[index]!, Number.EPSILON));
+    diskTangentialDispersion[index] = diskRadialDispersion[index]! * clamp(
+      epicyclicFrequency[index]! / (2 * omega),
+      0.35,
+      1,
+    );
+    diskVerticalDispersion[index] = clamp(
+      Math.sqrt(
+        Math.PI * GRAVITY * diskSurfaceDensity[index]! * verticalScaleHeight,
+      ),
+      circularSpeed * 0.02,
+      circularSpeed * 0.2,
+    );
+  }
+  diskRadialDispersion[0] = diskRadialDispersion[1]!;
+  diskTangentialDispersion[0] = diskTangentialDispersion[1]!;
+  diskVerticalDispersion[0] = diskVerticalDispersion[1]!;
+  for (let index = 1; index < RADIAL_TABLE_SIZE - 1; index++) {
+    const radius = radii[index]!;
+    const circularSpeedSquared = diskTotalAcceleration[index]! * radius;
+    const pressureBefore = Math.max(
+      diskSurfaceDensity[index - 1]! * diskRadialDispersion[index - 1]! ** 2,
+      1e-20,
+    );
+    const pressureAfter = Math.max(
+      diskSurfaceDensity[index + 1]! * diskRadialDispersion[index + 1]! ** 2,
+      1e-20,
+    );
+    const logarithmicPressureGradient = radius *
+      (Math.log(pressureAfter) - Math.log(pressureBefore)) / (2 * spacing);
+    const anisotropy = diskTangentialDispersion[index]! ** 2 /
+      Math.max(diskRadialDispersion[index]! ** 2, Number.EPSILON);
+    const driftCorrection = diskRadialDispersion[index]! ** 2 * Math.max(
+      0,
+      anisotropy - 1 - logarithmicPressureGradient,
+    );
+    diskMeanStreaming[index] = Math.sqrt(Math.max(
+      circularSpeedSquared - driftCorrection,
+      0,
+    ));
+  }
+  diskMeanStreaming[0] = diskMeanStreaming[1]!;
+  diskMeanStreaming[RADIAL_TABLE_SIZE - 1] = 0;
+
   // The halo uses the spherical monopole of the full composite potential.
   // Solving the isotropic Jeans equation against this acceleration makes its
   // velocity moments consistent with the truncated halo, disk, and core.
@@ -620,6 +735,11 @@ const buildEquilibriumModel = (parameters: GalaxyParameters) => {
     diskCumulative,
     haloCumulative,
     diskAcceleration,
+    diskSurfaceDensity,
+    diskRadialDispersion,
+    diskTangentialDispersion,
+    diskVerticalDispersion,
+    diskMeanStreaming,
     haloDispersionSquared,
     escapeSpeed,
     innerOrbitalPeriod,
@@ -659,6 +779,41 @@ const diskRadialAcceleration = (
     )) ** 1.5;
   return coreAcceleration + haloAcceleration +
     interpolateTable(model.radii, model.diskAcceleration, radius);
+};
+
+export const calculateDiskKinematics = (
+  requestedSettings: GalaxySettings,
+  radius: number,
+) => {
+  const { parameters } = deriveGalaxyParameters(requestedSettings);
+  const model = buildEquilibriumModel(parameters);
+  const safeRadius = clamp(radius, 0, parameters.radius);
+  return {
+    circularSpeed: Math.sqrt(Math.max(
+      diskRadialAcceleration(safeRadius, parameters, model) * safeRadius,
+      0,
+    )),
+    meanStreamingSpeed: interpolateTable(
+      model.radii,
+      model.diskMeanStreaming,
+      safeRadius,
+    ),
+    radialDispersion: interpolateTable(
+      model.radii,
+      model.diskRadialDispersion,
+      safeRadius,
+    ),
+    tangentialDispersion: interpolateTable(
+      model.radii,
+      model.diskTangentialDispersion,
+      safeRadius,
+    ),
+    verticalDispersion: interpolateTable(
+      model.radii,
+      model.diskVerticalDispersion,
+      safeRadius,
+    ),
+  };
 };
 
 export const createGalaxyInitialState = (
@@ -757,17 +912,32 @@ export const createGalaxyInitialState = (
       const z = state[offset + 2]!;
       const radius = Math.max(Math.hypot(x, z), Number.EPSILON);
       const angle = Math.atan2(z, x);
-      const circularSpeed = Math.sqrt(
-        Math.max(0, diskRadialAcceleration(radius, parameters, model) * radius),
+      const radialSigma = interpolateTable(
+        model.radii,
+        model.diskRadialDispersion,
+        radius,
       );
-      const radialDispersion =
-        gaussianSample(settings.seed, galaxy, ordinal, 4) * circularSpeed * 0.035;
-      const tangentialSpeed = circularSpeed +
-        gaussianSample(settings.seed, galaxy, ordinal, 6) * circularSpeed * 0.02;
+      const tangentialSigma = interpolateTable(
+        model.radii,
+        model.diskTangentialDispersion,
+        radius,
+      );
+      const verticalSigma = interpolateTable(
+        model.radii,
+        model.diskVerticalDispersion,
+        radius,
+      );
+      const radialVelocity =
+        gaussianSample(settings.seed, galaxy, ordinal, 4) * radialSigma;
+      const tangentialSpeed = interpolateTable(
+        model.radii,
+        model.diskMeanStreaming,
+        radius,
+      ) + gaussianSample(settings.seed, galaxy, ordinal, 6) * tangentialSigma;
       const velocity: Vec3 = [
-        Math.cos(angle) * radialDispersion - Math.sin(angle) * tangentialSpeed,
-        gaussianSample(settings.seed, galaxy, ordinal, 8) * circularSpeed * 0.025,
-        Math.sin(angle) * radialDispersion + Math.cos(angle) * tangentialSpeed,
+        Math.cos(angle) * radialVelocity - Math.sin(angle) * tangentialSpeed,
+        gaussianSample(settings.seed, galaxy, ordinal, 8) * verticalSigma,
+        Math.sin(angle) * radialVelocity + Math.cos(angle) * tangentialSpeed,
       ];
       state.set(velocity, offset + 4);
       diskVelocitySum = add(diskVelocitySum, velocity);

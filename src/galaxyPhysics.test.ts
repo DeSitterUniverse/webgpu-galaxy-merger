@@ -6,6 +6,7 @@ import {
   META_CORE,
   META_HALO,
   advanceCoreBinaryState,
+  calculateDiskKinematics,
   createGalaxyInitialState,
   sanitizeGalaxySettings,
   symmetricSofteningSquared,
@@ -15,6 +16,18 @@ import {
 const defaultSettings = { textureWidth: 56, radius: 35, offset: 25 };
 
 describe("live galaxy initialization", () => {
+  it("derives warm-disk moments and asymmetric drift from the force model", () => {
+    for (const radius of [5, 15, 28]) {
+      const moments = calculateDiskKinematics(defaultSettings, radius);
+      expect(moments.radialDispersion).toBeGreaterThan(0);
+      expect(moments.tangentialDispersion).toBeGreaterThan(0);
+      expect(moments.verticalDispersion).toBeGreaterThan(0);
+      expect(moments.meanStreamingSpeed).toBeLessThanOrEqual(
+        moments.circularSpeed,
+      );
+    }
+  });
+
   it("is byte-for-byte deterministic", () => {
     const first = createGalaxyInitialState(defaultSettings);
     const second = createGalaxyInitialState(defaultSettings);

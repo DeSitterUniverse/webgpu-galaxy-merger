@@ -5,6 +5,7 @@ import {
   calculateTreeHalfExtent,
   calculateBarnesHutMemoryLayout,
   chooseTreeDepth,
+  maximumTraversalStackEntries,
   maximumTreeNodeCount,
 } from "../../src/galaxyBarnesHutSolver";
 
@@ -54,5 +55,13 @@ describe("approximate solver mathematics", () => {
     expect(memory.maximumNodes).toBeLessThan(5 * 1024 ** 2);
     expect(memory.largestBufferBytes).toBeLessThanOrEqual(256 * 2 ** 20);
     expect(memory.totalBytes).toBeLessThan(512 * 2 ** 20);
+  });
+
+  it("cannot overflow the traversal stack at the million-body depth", () => {
+    const depth = chooseTreeDepth(1024 ** 2);
+    expect(maximumTraversalStackEntries(depth)).toBe(71);
+    expect(BARNES_HUT_TEST_CONSTANTS.traversalStackCapacity).toBeGreaterThanOrEqual(
+      maximumTraversalStackEntries(depth),
+    );
   });
 });

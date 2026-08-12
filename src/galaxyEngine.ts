@@ -27,6 +27,7 @@ import {
 } from "./galaxyBarnesHutSolver";
 import {
   GALAXY_SOLVERS,
+  sanitizeGalaxySettingsForSolver,
   type GalaxySolverFactory,
   type GalaxySolverInstance,
   type GalaxySolverKind,
@@ -118,6 +119,21 @@ let currentGalaxyRadius = 35;
 let currentOffset = 25;
 let currentSolverKind: GalaxySolverKind = "all-pairs";
 let isPaused = false;
+
+const applySanitizedSettings = (requested: {
+  textureWidth: number;
+  radius: number;
+  offset: number;
+}) => {
+  const settings = sanitizeGalaxySettingsForSolver(
+    requested,
+    currentSolverKind,
+  );
+  currentTextureWidth = settings.textureWidth;
+  currentGalaxyRadius = settings.radius;
+  currentOffset = settings.offset;
+  return settings;
+};
 
 const clamp = (value: number, minimum: number, maximum: number) =>
   Math.min(maximum, Math.max(minimum, value));
@@ -533,16 +549,21 @@ export const initGalaxyEngine = () => {
       // Accuracy readback is opt-in through the dedicated test-server query.
       // Normal development never imports or executes the O(n²) reference path.
       if (import.meta.env.PUBLIC_GALAXY_TEST_MODE === "true") {
-        const solver = new URLSearchParams(location.search).get("solverAccuracy");
+        const testParameters = new URLSearchParams(location.search);
+        const solver = testParameters.get("solverAccuracy");
         if (solver === "all-pairs" || solver === "barnes-hut") {
           void import("./galaxySolverAccuracy").then(async ({ runGalaxySolverAccuracy }) => {
             const requestedWidth = Number(
               new URLSearchParams(location.search).get("accuracyWidth") ?? 56,
             );
+            const requestedSamples = Number(
+              new URLSearchParams(location.search).get("accuracySamples") ?? 192,
+            );
             const result = await runGalaxySolverAccuracy(
               device,
               solver,
-              Math.min(320, Math.max(56, requestedWidth)),
+              Math.min(1024, Math.max(56, requestedWidth)),
+              Math.min(512, Math.max(2, requestedSamples)),
             );
             const output = document.createElement("pre");
             output.id = "galaxy-accuracy-results";
@@ -552,6 +573,28 @@ export const initGalaxyEngine = () => {
             dispatchStatus(
               "error",
               `Solver accuracy test failed: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+          });
+        }
+        if (testParameters.get("gpuEvolution") === "true") {
+          void import("./galaxyGpuEvolutionValidation").then(async ({
+            runGalaxyGpuEvolutionSuite,
+          }) => {
+            const requestedSteps = Number(testParameters.get("steps") ?? 1_000);
+            const result = await runGalaxyGpuEvolutionSuite(
+              device,
+              Math.min(10_000, Math.max(1, requestedSteps)),
+            );
+            const output = document.createElement("pre");
+            output.id = "galaxy-evolution-results";
+            output.textContent = JSON.stringify(result, null, 2);
+            document.body.append(output);
+          }).catch((error: unknown) => {
+            dispatchStatus(
+              "error",
+              `GPU evolution test failed: ${
                 error instanceof Error ? error.message : String(error)
               }`,
             );
@@ -589,7 +632,12 @@ export const initGalaxyEngine = () => {
   const buildGalaxy = async (generation: number) => {
     const activeBackend = await initializeBackend();
     if (disposed || generation !== buildGeneration) return;
-    const requestedParticleCount = currentTextureWidth ** 2;
+    const settings = applySanitizedSettings({
+      textureWidth: currentTextureWidth,
+      radius: currentGalaxyRadius,
+      offset: currentOffset,
+    });
+    const requestedParticleCount = settings.textureWidth ** 2;
     if (currentSolverKind === "barnes-hut") {
       const memory = calculateBarnesHutMemoryLayout(requestedParticleCount);
       const bufferLimit = Math.min(
@@ -598,7 +646,7 @@ export const initGalaxyEngine = () => {
       );
       if (memory.largestBufferBytes > bufferLimit) {
         throw new Error(
-          `${currentTextureWidth}x${currentTextureWidth} needs a ${
+          `${settings.textureWidth}x${settings.textureWidth} needs a ${
             (memory.largestBufferBytes / 2 ** 20).toFixed(0)
           } MiB tree buffer, above this GPU's ${
             (bufferLimit / 2 ** 20).toFixed(0)
@@ -607,11 +655,7 @@ export const initGalaxyEngine = () => {
       }
     }
     dispatchStatus("initializing", "Building deterministic galaxy state…");
-    const initial = createGalaxyInitialState({
-      textureWidth: currentTextureWidth,
-      radius: currentGalaxyRadius,
-      offset: currentOffset,
-    });
+    const initial = createGalaxyInitialState(settings);
     if (disposed || generation !== buildGeneration) return;
     const { device } = activeBackend;
     // State A/B alternate source and destination every step. Rendering reads
@@ -1205,21 +1249,28 @@ export const initGalaxyEngine = () => {
     }
   };
   const onGalaxyResize = (event: Event) => {
-    currentTextureWidth = Math.min((
-      event as CustomEvent<{ textureWidth: number }>
-    ).detail.textureWidth, GALAXY_SOLVERS[currentSolverKind].maxTextureWidth);
+    applySanitizedSettings({
+      textureWidth: (event as CustomEvent<{ textureWidth: number }>).detail
+        .textureWidth,
+      radius: currentGalaxyRadius,
+      offset: currentOffset,
+    });
     rebuildWithFizzle();
   };
   const onGalaxyRadius = (event: Event) => {
-    currentGalaxyRadius = (
-      event as CustomEvent<{ radius: number }>
-    ).detail.radius;
+    applySanitizedSettings({
+      textureWidth: currentTextureWidth,
+      radius: (event as CustomEvent<{ radius: number }>).detail.radius,
+      offset: currentOffset,
+    });
     rebuildWithFizzle();
   };
   const onGalaxyOffset = (event: Event) => {
-    currentOffset = (
-      event as CustomEvent<{ offset: number }>
-    ).detail.offset;
+    applySanitizedSettings({
+      textureWidth: currentTextureWidth,
+      radius: currentGalaxyRadius,
+      offset: (event as CustomEvent<{ offset: number }>).detail.offset,
+    });
     rebuildWithFizzle();
   };
   const onGalaxySolver = (event: Event) => {
@@ -1228,10 +1279,11 @@ export const initGalaxyEngine = () => {
     ).detail.solver;
     if (!Object.hasOwn(GALAXY_SOLVERS, requested) || requested === currentSolverKind) return;
     currentSolverKind = requested;
-    currentTextureWidth = Math.min(
-      currentTextureWidth,
-      GALAXY_SOLVERS[currentSolverKind].maxTextureWidth,
-    );
+    applySanitizedSettings({
+      textureWidth: currentTextureWidth,
+      radius: currentGalaxyRadius,
+      offset: currentOffset,
+    });
     rebuildWithFizzle();
   };
 
