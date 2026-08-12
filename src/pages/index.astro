@@ -118,8 +118,8 @@ const description = "A live galaxy merger that turns millions of interacting par
 
           <fieldset aria-label="Gravity solver">
             <legend>Gravity Solver</legend>
-            <button type="button" data-galaxy-solver="all-pairs" aria-pressed="true">All-Pairs</button>
-            <button type="button" data-galaxy-solver="barnes-hut" aria-pressed="false">Barnes-Hut</button>
+            <button type="button" data-galaxy-solver="all-pairs" aria-pressed="true">All-Pairs (O(n²))</button>
+            <button type="button" data-galaxy-solver="barnes-hut" aria-pressed="false">Barnes-Hut (O(n log n))</button>
           </fieldset>
 
           <output id="galaxy-backend-status" aria-live="polite" hidden>Idle</output>
