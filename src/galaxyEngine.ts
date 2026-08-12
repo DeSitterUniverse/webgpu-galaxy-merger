@@ -582,7 +582,7 @@ export const initGalaxyEngine = () => {
           void import("./galaxyGpuEvolutionValidation").then(async ({
             runGalaxyGpuEvolutionSuite,
           }) => {
-            const requestedSteps = Number(testParameters.get("steps") ?? 1_000);
+            const requestedSteps = Number(testParameters.get("steps") ?? 1_024);
             const result = await runGalaxyGpuEvolutionSuite(
               device,
               Math.min(10_000, Math.max(1, requestedSteps)),

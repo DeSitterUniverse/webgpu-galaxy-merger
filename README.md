@@ -81,4 +81,4 @@ The longer galaxy suite checks isolated stability, conservation, and live-halo d
 The GPU test environment provides two browser-driven checks:
 
 - `/?solverAccuracy=barnes-hut&accuracyWidth=520&accuracySamples=32` compares a depth-ten force evaluation with exact CPU summation and reports traversal overflow.
-- `/?gpuEvolution=true&steps=1000` advances fixed and adaptive all-pairs and Barnes-Hut modes through the production WGSL integration passes, synchronizes staggered velocities, and reports energy, momentum, angular momentum, center-of-mass, and CPU trajectory differences.
+- `/?gpuEvolution=true&steps=1024` advances fixed and adaptive all-pairs and Barnes-Hut modes through the production WGSL integration passes. The default checkpoint aligns every power-of-two timestep bin. An all-particle diagnostic force pass also supports arbitrary checkpoints, reconstructing synchronized velocities from both the last-active and current accelerations. Conservation thresholds use full momentum, angular-momentum, and center-of-mass vector differences alongside energy and CPU trajectory comparisons.

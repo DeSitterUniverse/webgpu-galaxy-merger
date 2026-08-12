@@ -23,11 +23,13 @@ export type GalaxyGpuEvolutionMode = {
   adaptive: boolean;
 };
 
+type Vec3 = [number, number, number];
+
 type Diagnostics = {
   energy: number;
-  momentumMagnitude: number;
-  angularMomentumMagnitude: number;
-  centerOfMassMagnitude: number;
+  momentum: Vec3;
+  angularMomentum: Vec3;
+  centerOfMass: Vec3;
 };
 
 export type GalaxyGpuEvolutionResult = GalaxyGpuEvolutionMode & {
@@ -50,6 +52,31 @@ const PARTICLE_COUNT = 128;
 const BASE_TIME_STEP = 0.002;
 const GRAVITY = 1;
 const SOFTENING = 0.08;
+
+const magnitude = (value: readonly number[]) => Math.hypot(...value);
+
+export const vectorDifferenceMagnitude = (
+  final: readonly number[],
+  initial: readonly number[],
+) => magnitude(final.map((value, axis) => value - initial[axis]!));
+
+export const relativeVectorDrift = (
+  final: readonly number[],
+  initial: readonly number[],
+) => vectorDifferenceMagnitude(final, initial) /
+  Math.max(magnitude(initial), Number.EPSILON);
+
+export const synchronizeBlockVelocity = (
+  staggeredVelocity: number,
+  lastActiveAcceleration: number,
+  currentAcceleration: number,
+  intervalTicks: number,
+  elapsedTicks: number,
+  baseTimeStep: number,
+) => staggeredVelocity -
+  0.5 * lastActiveAcceleration * intervalTicks * baseTimeStep +
+  0.5 * (lastActiveAcceleration + currentAcceleration) *
+    elapsedTicks * baseTimeStep;
 
 const factoryFor = (solver: GalaxySolverKind): GalaxySolverFactory =>
   solver === "all-pairs" ? createAllPairsSolver : createBarnesHutSolver;
@@ -187,9 +214,9 @@ const diagnostics = (state: ArrayLike<number>): Diagnostics => {
   let totalMass = 0;
   let kinetic = 0;
   let potential = 0;
-  const momentum = [0, 0, 0];
-  const angular = [0, 0, 0];
-  const center = [0, 0, 0];
+  const momentum: Vec3 = [0, 0, 0];
+  const angularMomentum: Vec3 = [0, 0, 0];
+  const centerOfMass: Vec3 = [0, 0, 0];
   for (let index = 0; index < PARTICLE_COUNT; index++) {
     const offset = index * 8;
     const mass = state[offset + 3]!;
@@ -204,12 +231,12 @@ const diagnostics = (state: ArrayLike<number>): Diagnostics => {
     momentum[0] = momentum[0]! + mass * vx;
     momentum[1] = momentum[1]! + mass * vy;
     momentum[2] = momentum[2]! + mass * vz;
-    angular[0] = angular[0]! + mass * (y * vz - z * vy);
-    angular[1] = angular[1]! + mass * (z * vx - x * vz);
-    angular[2] = angular[2]! + mass * (x * vy - y * vx);
-    center[0] = center[0]! + mass * x;
-    center[1] = center[1]! + mass * y;
-    center[2] = center[2]! + mass * z;
+    angularMomentum[0] += mass * (y * vz - z * vy);
+    angularMomentum[1] += mass * (z * vx - x * vz);
+    angularMomentum[2] += mass * (x * vy - y * vx);
+    centerOfMass[0] += mass * x;
+    centerOfMass[1] += mass * y;
+    centerOfMass[2] += mass * z;
     for (let right = index + 1; right < PARTICLE_COUNT; right++) {
       const rightOffset = right * 8;
       const dx = state[rightOffset]! - x;
@@ -223,13 +250,13 @@ const diagnostics = (state: ArrayLike<number>): Diagnostics => {
     }
   }
   for (let axis = 0; axis < 3; axis++) {
-    center[axis] = center[axis]! / totalMass;
+    centerOfMass[axis] = centerOfMass[axis]! / totalMass;
   }
   return {
     energy: kinetic + potential,
-    momentumMagnitude: Math.hypot(...momentum),
-    angularMomentumMagnitude: Math.hypot(...angular),
-    centerOfMassMagnitude: Math.hypot(...center),
+    momentum,
+    angularMomentum,
+    centerOfMass,
   };
 };
 
@@ -270,7 +297,7 @@ const readBuffer = async (
 export const runGalaxyGpuEvolutionValidation = async (
   device: GPUDevice,
   mode: GalaxyGpuEvolutionMode,
-  steps = 1_000,
+  steps = 1_024,
 ): Promise<GalaxyGpuEvolutionResult> => {
   const initial = createValidationState();
   const stateBytes = initial.state.byteLength;
@@ -294,19 +321,19 @@ export const runGalaxyGpuEvolutionValidation = async (
     device,
     "GPU evolution active indices",
     createInitialActiveIndices(PARTICLE_COUNT),
-    GPUBufferUsage.STORAGE,
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   );
   const adaptiveControlBuffer = createBufferWithData(
     device,
     "GPU evolution adaptive control",
     createInitialAdaptiveControl(PARTICLE_COUNT),
-    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
   );
   const indirectDispatchBuffer = createBufferWithData(
     device,
     "GPU evolution indirect dispatch",
     createInitialIndirectDispatch(PARTICLE_COUNT),
-    GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT,
+    GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
   );
   const parameterBuffer = createBufferWithData(
     device,
@@ -457,18 +484,50 @@ export const runGalaxyGpuEvolutionValidation = async (
     await device.queue.onSubmittedWorkDone();
   }
 
-  const [stateCopy, accelerationCopy, timestepCopy, controlCopy] = await Promise.all([
+  const [stateCopy, lastAccelerationCopy, timestepCopy, controlCopy] = await Promise.all([
     readBuffer(device, stateBuffers[readIndex], stateBytes),
     readBuffer(device, accelerationBuffer, PARTICLE_COUNT * 16),
     readBuffer(device, timestepBuffer, PARTICLE_COUNT * 16),
     readBuffer(device, adaptiveControlBuffer, 16),
   ]);
+  // Force every target once at the final synchronized position. This pass is
+  // diagnostic-only: it does not advance the scheduler, kick velocities, or
+  // alter particle state. Keeping the previous active acceleration separately
+  // lets arbitrary block-step phases use both force endpoints.
+  device.queue.writeBuffer(
+    activeIndicesBuffer,
+    0,
+    createInitialActiveIndices(PARTICLE_COUNT),
+  );
+  device.queue.writeBuffer(
+    adaptiveControlBuffer,
+    Uint32Array.BYTES_PER_ELEMENT,
+    new Uint32Array([PARTICLE_COUNT, 0]),
+  );
+  device.queue.writeBuffer(
+    indirectDispatchBuffer,
+    0,
+    createInitialIndirectDispatch(PARTICLE_COUNT),
+  );
+  const finalForceEncoder = device.createCommandEncoder({
+    label: "GPU evolution final all-particle force encoder",
+  });
+  solver.encode(finalForceEncoder, readIndex);
+  device.queue.submit([finalForceEncoder.finish()]);
+  await device.queue.onSubmittedWorkDone();
+  const currentAccelerationCopy = await readBuffer(
+    device,
+    accelerationBuffer,
+    PARTICLE_COUNT * 16,
+  );
   const finalState = new Float64Array(Float32Array.from(new Float32Array(stateCopy)));
-  const finalAcceleration = new Float32Array(accelerationCopy);
+  const lastAcceleration = new Float32Array(lastAccelerationCopy);
+  const currentAcceleration = new Float32Array(currentAccelerationCopy);
   const finalTimesteps = new Uint32Array(timestepCopy);
   const finalControl = new Uint32Array(controlCopy);
-  // Convert each staggered half-step velocity to the common final force time
-  // before evaluating conservation and comparing with the CPU DKD reference.
+  // Recover velocity at the common final force time. First undo the future
+  // half-kick made at the particle's last active tick, then integrate from that
+  // tick to T with a trapezoid over the last-active and current accelerations.
   const finalTick = finalControl[0]!;
   for (let index = 0; index < PARTICLE_COUNT; index++) {
     const stateOffset = index * 8;
@@ -476,11 +535,17 @@ export const runGalaxyGpuEvolutionValidation = async (
     const accelerationOffset = index * 4;
     const nextActiveTick = finalTimesteps[timestepOffset]!;
     const interval = Math.max(finalTimesteps[timestepOffset + 1]!, 1);
-    const velocityTick = nextActiveTick - 0.5 * interval;
-    const synchronizationOffset = (finalTick - velocityTick) * BASE_TIME_STEP;
+    const lastActiveTick = nextActiveTick - interval;
+    const elapsedTicks = finalTick - lastActiveTick;
     for (let axis = 0; axis < 3; axis++) {
-      finalState[stateOffset + 4 + axis] = finalState[stateOffset + 4 + axis]! +
-        finalAcceleration[accelerationOffset + axis]! * synchronizationOffset;
+      finalState[stateOffset + 4 + axis] = synchronizeBlockVelocity(
+        finalState[stateOffset + 4 + axis]!,
+        lastAcceleration[accelerationOffset + axis]!,
+        currentAcceleration[accelerationOffset + axis]!,
+        interval,
+        elapsedTicks,
+        BASE_TIME_STEP,
+      );
     }
   }
   const cpuState = evolveCpu(initial.state, steps);
@@ -506,21 +571,22 @@ export const runGalaxyGpuEvolutionValidation = async (
     (finalDiagnostics.energy - initialDiagnostics.energy) /
       initialDiagnostics.energy,
   );
-  const momentumDrift = Math.abs(
-    finalDiagnostics.momentumMagnitude - initialDiagnostics.momentumMagnitude,
+  const momentumDrift = vectorDifferenceMagnitude(
+    finalDiagnostics.momentum,
+    initialDiagnostics.momentum,
   );
-  const relativeAngularMomentumDrift = Math.abs(
-    (finalDiagnostics.angularMomentumMagnitude -
-      initialDiagnostics.angularMomentumMagnitude) /
-      initialDiagnostics.angularMomentumMagnitude,
+  const relativeAngularMomentumDrift = relativeVectorDrift(
+    finalDiagnostics.angularMomentum,
+    initialDiagnostics.angularMomentum,
   );
-  const centerOfMassDrift = Math.abs(
-    finalDiagnostics.centerOfMassMagnitude - initialDiagnostics.centerOfMassMagnitude,
+  const centerOfMassDrift = vectorDifferenceMagnitude(
+    finalDiagnostics.centerOfMass,
+    initialDiagnostics.centerOfMass,
   );
   const positionRmsDifferenceFromCpu = Math.sqrt(positionError / positionReference);
   const velocityRmsDifferenceFromCpu = Math.sqrt(velocityError / velocityReference);
   const schedulerOrTraversalOverflow = finalControl[2] !== 0 ||
-    finalAcceleration.some((value, index) => index % 4 === 3 && value !== 0);
+    currentAcceleration.some((value, index) => index % 4 === 3 && value !== 0);
   const result: GalaxyGpuEvolutionResult = {
     ...mode,
     particleCount: PARTICLE_COUNT,
@@ -558,7 +624,7 @@ export const runGalaxyGpuEvolutionValidation = async (
 
 export const runGalaxyGpuEvolutionSuite = async (
   device: GPUDevice,
-  steps = 1_000,
+  steps = 1_024,
 ) => Promise.all([
   runGalaxyGpuEvolutionValidation(device, { solver: "all-pairs", adaptive: false }, steps),
   runGalaxyGpuEvolutionValidation(device, { solver: "all-pairs", adaptive: true }, steps),
