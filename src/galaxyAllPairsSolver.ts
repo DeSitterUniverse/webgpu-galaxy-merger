@@ -19,6 +19,8 @@ struct SolverParameters {
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
 @group(0) @binding(1) var<storage, read_write> accelerations: array<vec4f>;
 @group(0) @binding(2) var<uniform> parameters: SolverParameters;
+@group(0) @binding(3) var<storage, read> activeIndices: array<u32>;
+@group(0) @binding(4) var<storage, read> adaptiveControl: array<u32>;
 
 var<workgroup> tilePositions: array<vec4f, ${WORKGROUP_SIZE}>;
 var<workgroup> tileSoftenings: array<f32, ${WORKGROUP_SIZE}>;
@@ -28,10 +30,13 @@ fn calculateForces(
   @builtin(global_invocation_id) globalId: vec3u,
   @builtin(local_invocation_id) localId: vec3u,
 ) {
-  let index = globalId.x;
-  let valid = index < parameters.particleCount;
+  let activeOrdinal = globalId.x;
+  let activeCount = min(adaptiveControl[1], parameters.particleCount);
+  let valid = activeOrdinal < activeCount;
+  var index = 0u;
   var particle = Particle(vec4f(0.0), vec4f(0.0));
   if (valid) {
+    index = activeIndices[activeOrdinal];
     particle = particles[index];
   }
   var acceleration = vec3f(0.0);
@@ -79,6 +84,9 @@ export const createAllPairsSolver: GalaxySolverFactory = async ({
   initial,
   stateBuffers,
   accelerationBuffer,
+  activeIndicesBuffer,
+  adaptiveControlBuffer,
+  indirectDispatchBuffer,
 }) => {
   const module = device.createShaderModule({
     label: "Galaxy all-pairs solver module",
@@ -107,6 +115,8 @@ export const createAllPairsSolver: GalaxySolverFactory = async ({
         { binding: 0, resource: { buffer: stateBuffer } },
         { binding: 1, resource: { buffer: accelerationBuffer } },
         { binding: 2, resource: { buffer: parameterBuffer } },
+        { binding: 3, resource: { buffer: activeIndicesBuffer } },
+        { binding: 4, resource: { buffer: adaptiveControlBuffer } },
       ],
     }),
   ) as [GPUBindGroup, GPUBindGroup];
@@ -117,9 +127,7 @@ export const createAllPairsSolver: GalaxySolverFactory = async ({
       const pass = encoder.beginComputePass({ label: "All-pairs force pass" });
       pass.setPipeline(pipeline);
       pass.setBindGroup(0, bindGroups[sourceIndex]);
-      pass.dispatchWorkgroups(
-        Math.ceil(initial.parameters.particleCount / WORKGROUP_SIZE),
-      );
+      pass.dispatchWorkgroupsIndirect(indirectDispatchBuffer, 0);
       pass.end();
     },
     destroy: () => parameterBuffer.destroy(),

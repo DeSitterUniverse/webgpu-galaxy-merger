@@ -7,6 +7,11 @@ import {
   type GalaxySolverFactory,
   type GalaxySolverKind,
 } from "./galaxySolver";
+import {
+  createInitialActiveIndices,
+  createInitialAdaptiveControl,
+  createInitialIndirectDispatch,
+} from "./galaxyAdaptiveTimesteps";
 
 const SAMPLE_TARGETS = 192;
 
@@ -107,11 +112,32 @@ export const runGalaxySolverAccuracy = async (
     size: initial.parameters.particleCount * 16,
     usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
   });
+  const activeIndicesBuffer = createBufferWithData(
+    device,
+    "Accuracy active indices",
+    createInitialActiveIndices(initial.parameters.particleCount),
+    GPUBufferUsage.STORAGE,
+  );
+  const adaptiveControlBuffer = createBufferWithData(
+    device,
+    "Accuracy adaptive control",
+    createInitialAdaptiveControl(initial.parameters.particleCount),
+    GPUBufferUsage.STORAGE,
+  );
+  const indirectDispatchBuffer = createBufferWithData(
+    device,
+    "Accuracy indirect dispatch",
+    createInitialIndirectDispatch(initial.parameters.particleCount),
+    GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT,
+  );
   const solver = await factories[solverKind]({
     device,
     initial,
     stateBuffers,
     accelerationBuffer,
+    activeIndicesBuffer,
+    adaptiveControlBuffer,
+    indirectDispatchBuffer,
   });
   const encoder = device.createCommandEncoder({ label: "Solver accuracy encoder" });
   solver.encode(encoder, 0);
@@ -194,6 +220,9 @@ export const runGalaxySolverAccuracy = async (
   relativeErrors.sort((left, right) => left - right);
 
   solver.destroy();
+  activeIndicesBuffer.destroy();
+  adaptiveControlBuffer.destroy();
+  indirectDispatchBuffer.destroy();
   stateBuffers.forEach((buffer) => buffer.destroy());
   accelerationBuffer.destroy();
   readback.destroy();

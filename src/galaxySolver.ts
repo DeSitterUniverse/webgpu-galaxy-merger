@@ -20,7 +20,7 @@ export const GALAXY_SOLVERS: Record<GalaxySolverKind, GalaxySolverDefinition> = 
     kind: "barnes-hut",
     label: "Barnes-Hut",
     description: "Compact occupied-node linear octree",
-    maxTextureWidth: 256,
+    maxTextureWidth: 1024,
   },
 };
 
@@ -38,6 +38,9 @@ export type GalaxySolverCreateOptions = {
   initial: GalaxyInitialState;
   stateBuffers: [GPUBuffer, GPUBuffer];
   accelerationBuffer: GPUBuffer;
+  activeIndicesBuffer: GPUBuffer;
+  adaptiveControlBuffer: GPUBuffer;
+  indirectDispatchBuffer: GPUBuffer;
 };
 
 export type GalaxySolverFactory = (

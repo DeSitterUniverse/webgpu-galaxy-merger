@@ -5,9 +5,9 @@ A real-time collisionless galaxy merger running entirely in the browser. Each ga
 ## Simulation model
 
 - WebGPU compute and rendering pipelines written in WGSL
-- Second-order leapfrog integration with half-step velocities
+- Hierarchical leapfrog integration with per-particle power-of-two block timesteps
 - Exact workgroup-tiled all-pairs gravity up to 160x160 particles
-- Compact occupied-node Barnes-Hut gravity up to 256x256 particles
+- Compact occupied-node Barnes-Hut gravity up to 1024x1024 particles
 - Equal-mass stellar and halo super-particles with fixed component masses
 - Separate, resolution-aware disk, halo, and core softening
 - Truncated exponential stellar disks with smooth outer tapers
@@ -22,17 +22,19 @@ The live model supports disk-halo coupling, halo wakes, dynamical friction, tida
 
 The all-pairs solver is the exact reference implementation. It tiles particle data through workgroup memory and evaluates every pair with symmetric component softening.
 
-The Barnes-Hut solver constructs a compact seven-level octree on the GPU. Lock-free child elections create only occupied paths, terminal buckets use exact direct sums, and a center-of-mass-offset opening criterion controls monopole acceptance. Compact cores use a tighter opening angle to protect their orbital forces.
+The Barnes-Hut solver constructs a compact seven-to-nine-level octree on the GPU. Lock-free child elections create only occupied paths, terminal buckets use exact direct sums, and a center-of-mass-offset opening criterion controls monopole acceptance. Compact cores use a tighter opening angle to protect their orbital forces. Very dense unresolved terminal cells switch to a softened monopole with the target mass removed, bounding the close-cluster cost without introducing self-force.
+
+Every particle drifts on the base clock, while force traversal and kicks run only for particles whose individual timestep bin is active. Timestep intervals are quantized from 1 to 16 base ticks using the local acceleration and component softening. Faster bins can be entered immediately; slower bins are entered only at synchronized power-of-two boundaries. Tree moments are refreshed every tick, while occupied topology is rebuilt every four ticks. Rendering is sampled independently from the simulation state, so a million live bodies do not require a million visible instances.
 
 Measured on an AMD Radeon RX 6700 XT:
 
-| Resolution | Bodies | Barnes-Hut physics steps/s |
+| Resolution | Bodies | Barnes-Hut base ticks/s |
 | ---: | ---: | ---: |
-| 160x160 | 25,600 | 60.0 |
-| 192x192 | 36,864 | 46.2 |
-| 256x256 | 65,536 | 27.2 |
+| 512x512 | 262,144 | 18.7 |
+| 768x768 | 589,824 | 11.5 |
+| 1024x1024 | 1,048,576 | 4.1 |
 
-The 160x160 result reaches the demo's 60-step frame-loop ceiling.
+These are completed base integration ticks, measured after initialization. Individual force evaluations occur according to each particle's active timestep bin. Million-body mode requires a WebGPU adapter with sufficiently large storage-buffer limits and several hundred MiB of available GPU memory; the engine checks those limits before allocation.
 
 Force comparison against exact all-pairs gravity:
 
@@ -62,7 +64,3 @@ npm run build
 ```
 
 The longer galaxy suite checks isolated stability and conservation against a CPU reference model. GPU force comparison is available only through the opt-in `npm run dev:galaxy-test` environment.
-
-## Current limits
-
-This is a low-particle collisionless model. It does not include gas, hydrodynamics, star formation, feedback, or a separate bulge component. The live halo improves collective behavior but is not intended as a converged research-scale calculation.

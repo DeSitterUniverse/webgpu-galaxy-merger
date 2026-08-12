@@ -4,12 +4,27 @@ import {
   type GalaxyInitialState,
 } from "./galaxyPhysics";
 import {
-  galaxyComputeShader,
+  galaxyMergeShader,
   galaxyRenderShader,
   WORKGROUP_SIZE,
 } from "./galaxyShaders";
+import {
+  createInitialActiveIndices,
+  createInitialAdaptiveControl,
+  createInitialIndirectDispatch,
+  galaxyAdaptiveInitializeShader,
+  galaxyAdaptiveKickShader,
+  galaxyDriftShader,
+  galaxyScheduleShader,
+  MAX_TIME_BIN,
+  TIMESTEP_ETA,
+  TIMESTEP_STATE_BYTES,
+} from "./galaxyAdaptiveTimesteps";
 import { createAllPairsSolver } from "./galaxyAllPairsSolver";
-import { createBarnesHutSolver } from "./galaxyBarnesHutSolver";
+import {
+  calculateBarnesHutMemoryLayout,
+  createBarnesHutSolver,
+} from "./galaxyBarnesHutSolver";
 import {
   GALAXY_SOLVERS,
   type GalaxySolverFactory,
@@ -39,11 +54,13 @@ type WebGPUBackend = {
   context: GPUCanvasContext;
   format: GPUTextureFormat;
   initializePipeline: GPUComputePipeline;
-  stepPipeline: GPUComputePipeline;
+  driftPipeline: GPUComputePipeline;
+  scheduleBeginPipeline: GPUComputePipeline;
+  scheduleCollectPipeline: GPUComputePipeline;
+  scheduleFinishPipeline: GPUComputePipeline;
+  kickPipeline: GPUComputePipeline;
   mergePipeline: GPUComputePipeline;
   renderPipeline: GPURenderPipeline;
-  computeBindGroupLayout: GPUBindGroupLayout;
-  renderBindGroupLayout: GPUBindGroupLayout;
 };
 
 // Resources rebuilt by particle-count/radius/offset controls live separately
@@ -54,11 +71,23 @@ type SimulationResources = {
   visualBuffer: GPUBuffer;
   parameterBuffer: GPUBuffer;
   accelerationBuffer: GPUBuffer;
+  timestepBuffer: GPUBuffer;
+  activeIndicesBuffer: GPUBuffer;
+  adaptiveControlBuffer: GPUBuffer;
+  indirectDispatchBuffer: GPUBuffer;
   solver: GalaxySolverInstance;
   telemetryBuffer: GPUBuffer;
   telemetryReadbacks: TelemetryReadbackSlot[];
   renderParameterBuffer: GPUBuffer;
-  computeBindGroups: [GPUBindGroup, GPUBindGroup];
+  renderIndexBuffer: GPUBuffer;
+  renderCount: number;
+  initializeBindGroups: [GPUBindGroup, GPUBindGroup];
+  driftBindGroups: [GPUBindGroup, GPUBindGroup];
+  scheduleBeginBindGroup: GPUBindGroup;
+  scheduleCollectBindGroups: [GPUBindGroup, GPUBindGroup];
+  scheduleFinishBindGroup: GPUBindGroup;
+  kickBindGroups: [GPUBindGroup, GPUBindGroup];
+  mergeBindGroups: [GPUBindGroup, GPUBindGroup];
   renderBindGroups: [GPUBindGroup, GPUBindGroup];
   readIndex: PingPongIndex;
   simulationTime: number;
@@ -75,6 +104,7 @@ const TELEMETRY_READBACK_SLOTS = 3;
 const TELEMETRY_BYTES = 16;
 const STATE_BYTES_PER_PARTICLE = 8 * Float32Array.BYTES_PER_ELEMENT;
 const ACCELERATION_BYTES_PER_PARTICLE = 4 * Float32Array.BYTES_PER_ELEMENT;
+const MAX_RENDER_PARTICLES = 262_144;
 const SOLVER_FACTORIES: Record<GalaxySolverKind, GalaxySolverFactory> = {
   "all-pairs": createAllPairsSolver,
   "barnes-hut": createBarnesHutSolver,
@@ -190,16 +220,48 @@ const createBufferWithData = (
   return buffer;
 };
 
+export const createRenderSample = (
+  visuals: Float32Array,
+  maximumParticles = MAX_RENDER_PARTICLES,
+) => {
+  const visibleCount = visuals.length / 4;
+  const luminous: number[] = [];
+  for (let index = 0; index < visibleCount; index++) {
+    if (visuals[index * 4 + 3]! > 0) luminous.push(index);
+  }
+  const sampleCount = Math.min(luminous.length, maximumParticles);
+  const indices = new Uint32Array(sampleCount);
+  const sampledVisuals = new Float32Array(sampleCount * 4);
+  for (let ordinal = 0; ordinal < sampleCount; ordinal++) {
+    const sourceOrdinal = Math.min(
+      luminous.length - 1,
+      Math.floor((ordinal * luminous.length) / sampleCount),
+    );
+    const particleIndex = luminous[sourceOrdinal]!;
+    indices[ordinal] = particleIndex;
+    sampledVisuals.set(
+      visuals.subarray(particleIndex * 4, particleIndex * 4 + 4),
+      ordinal * 4,
+    );
+  }
+  return { indices, visuals: sampledVisuals };
+};
+
 const destroySimulation = (simulation: SimulationResources | null) => {
   if (!simulation) return;
   simulation.stateBuffers.forEach((buffer) => buffer.destroy());
   simulation.visualBuffer.destroy();
   simulation.parameterBuffer.destroy();
   simulation.accelerationBuffer.destroy();
+  simulation.timestepBuffer.destroy();
+  simulation.activeIndicesBuffer.destroy();
+  simulation.adaptiveControlBuffer.destroy();
+  simulation.indirectDispatchBuffer.destroy();
   simulation.solver.destroy();
   simulation.telemetryBuffer.destroy();
   simulation.telemetryReadbacks.forEach(({ buffer }) => buffer.destroy());
   simulation.renderParameterBuffer.destroy();
+  simulation.renderIndexBuffer.destroy();
 };
 
 export const initGalaxyEngine = () => {
@@ -220,6 +282,7 @@ export const initGalaxyEngine = () => {
   let buildGeneration = 0;
   let canvasConfigured = false;
   let validationError: string | null = null;
+  let physicsSubmissionPending = false;
 
   const dispatchStatus = (
     state: "initializing" | "ready" | "unsupported" | "error",
@@ -280,7 +343,7 @@ export const initGalaxyEngine = () => {
       if (!adapter) {
         throw new Error("No compatible WebGPU adapter was found.");
       }
-      if (adapter.limits.maxStorageBuffersPerShaderStage < 7) {
+      if (adapter.limits.maxStorageBuffersPerShaderStage < 8) {
         throw new Error(
           "This GPU exposes too few storage buffers for the galaxy solver.",
         );
@@ -298,6 +361,11 @@ export const initGalaxyEngine = () => {
         );
       }
       const requiredLimits: Record<string, GPUSize64> = {};
+      // Million-particle trees need buffers above WebGPU's conservative
+      // defaults. Request only limits already exposed by this adapter.
+      requiredLimits.maxBufferSize = adapter.limits.maxBufferSize;
+      requiredLimits.maxStorageBufferBindingSize =
+        adapter.limits.maxStorageBufferBindingSize;
       if (WORKGROUP_SIZE > 256) {
         requiredLimits.maxComputeInvocationsPerWorkgroup = WORKGROUP_SIZE;
         requiredLimits.maxComputeWorkgroupSizeX = WORKGROUP_SIZE;
@@ -315,106 +383,92 @@ export const initGalaxyEngine = () => {
       }
       const format = navigator.gpu.getPreferredCanvasFormat();
 
-      const computeModule = device.createShaderModule({
-        label: "Galaxy shared leapfrog compute module",
-        code: galaxyComputeShader,
+      const initializeModule = device.createShaderModule({
+        label: "Galaxy adaptive leapfrog initializer",
+        code: galaxyAdaptiveInitializeShader,
+      });
+      const driftModule = device.createShaderModule({
+        label: "Galaxy adaptive drift module",
+        code: galaxyDriftShader,
+      });
+      const scheduleModule = device.createShaderModule({
+        label: "Galaxy block timestep scheduler",
+        code: galaxyScheduleShader,
+      });
+      const kickModule = device.createShaderModule({
+        label: "Galaxy adaptive kick module",
+        code: galaxyAdaptiveKickShader,
+      });
+      const mergeModule = device.createShaderModule({
+        label: "Galaxy swept core merger module",
+        code: galaxyMergeShader,
       });
       const renderModule = device.createShaderModule({
         label: "Galaxy billboard render module",
         code: galaxyRenderShader,
       });
-      const [computeErrors, renderErrors] = await Promise.all([
-        compilationErrors(computeModule),
+      const shaderErrors = (await Promise.all([
+        compilationErrors(initializeModule),
+        compilationErrors(driftModule),
+        compilationErrors(scheduleModule),
+        compilationErrors(kickModule),
+        compilationErrors(mergeModule),
         compilationErrors(renderModule),
-      ]);
-      if (computeErrors.length || renderErrors.length) {
+      ])).flat();
+      if (shaderErrors.length) {
         device.destroy();
-        throw new Error(
-          [...computeErrors, ...renderErrors].join("\n"),
-        );
+        throw new Error(shaderErrors.join("\n"));
       }
 
-      // Explicit layouts keep both ping-pong bind groups compatible with the
-      // same compute pipeline and make resource ownership easy to audit.
-      const computeBindGroupLayout = device.createBindGroupLayout({
-        label: "Galaxy compute bind group layout",
-        entries: [
-          {
-            binding: 0,
-            visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "read-only-storage" },
-          },
-          {
-            binding: 1,
-            visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "storage" },
-          },
-          {
-            binding: 2,
-            visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "uniform" },
-          },
-          {
-            binding: 3,
-            visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "storage" },
-          },
-          {
-            binding: 4,
-            visibility: GPUShaderStage.COMPUTE,
-            buffer: { type: "read-only-storage" },
-          },
-        ],
-      });
-      const computeLayout = device.createPipelineLayout({
-        label: "Galaxy compute pipeline layout",
-        bindGroupLayouts: [computeBindGroupLayout],
-      });
-      const renderBindGroupLayout = device.createBindGroupLayout({
-        label: "Galaxy render bind group layout",
-        entries: [
-          {
-            binding: 0,
-            visibility: GPUShaderStage.VERTEX,
-            buffer: { type: "read-only-storage" },
-          },
-          {
-            binding: 1,
-            visibility: GPUShaderStage.VERTEX,
-            buffer: { type: "read-only-storage" },
-          },
-          {
-            binding: 2,
-            visibility: GPUShaderStage.VERTEX,
-            buffer: { type: "uniform" },
-          },
-        ],
-      });
-      const renderLayout = device.createPipelineLayout({
-        label: "Galaxy render pipeline layout",
-        bindGroupLayouts: [renderBindGroupLayout],
-      });
-
-      const [initializePipeline, stepPipeline, mergePipeline, renderPipeline] =
+      const [
+        initializePipeline,
+        driftPipeline,
+        scheduleBeginPipeline,
+        scheduleCollectPipeline,
+        scheduleFinishPipeline,
+        kickPipeline,
+        mergePipeline,
+        renderPipeline,
+      ] =
         await Promise.all([
           device.createComputePipelineAsync({
-            label: "Galaxy leapfrog half-step initializer",
-            layout: computeLayout,
-            compute: { module: computeModule, entryPoint: "initializeLeapfrog" },
+            label: "Galaxy adaptive leapfrog initializer",
+            layout: "auto",
+            compute: { module: initializeModule, entryPoint: "initializeAdaptiveLeapfrog" },
           }),
           device.createComputePipelineAsync({
-            label: "Galaxy tiled leapfrog step",
-            layout: computeLayout,
-            compute: { module: computeModule, entryPoint: "leapfrogStep" },
+            label: "Galaxy block-step drift",
+            layout: "auto",
+            compute: { module: driftModule, entryPoint: "driftParticles" },
+          }),
+          device.createComputePipelineAsync({
+            label: "Galaxy begin active schedule",
+            layout: "auto",
+            compute: { module: scheduleModule, entryPoint: "beginSchedule" },
+          }),
+          device.createComputePipelineAsync({
+            label: "Galaxy collect active particles",
+            layout: "auto",
+            compute: { module: scheduleModule, entryPoint: "collectActiveParticles" },
+          }),
+          device.createComputePipelineAsync({
+            label: "Galaxy finish active schedule",
+            layout: "auto",
+            compute: { module: scheduleModule, entryPoint: "finishSchedule" },
+          }),
+          device.createComputePipelineAsync({
+            label: "Galaxy adaptive block kick",
+            layout: "auto",
+            compute: { module: kickModule, entryPoint: "kickActiveParticles" },
           }),
           device.createComputePipelineAsync({
             label: "Galaxy swept core merger",
-            layout: computeLayout,
-            compute: { module: computeModule, entryPoint: "mergeCores" },
+            layout: "auto",
+            compute: { module: mergeModule, entryPoint: "mergeCores" },
           }),
           device.createRenderPipelineAsync({
             label: "Galaxy WebGPU particle renderer",
-            layout: renderLayout,
+            layout: "auto",
             vertex: { module: renderModule, entryPoint: "vertexMain" },
             fragment: {
               module: renderModule,
@@ -448,11 +502,13 @@ export const initGalaxyEngine = () => {
         context,
         format,
         initializePipeline,
-        stepPipeline,
+        driftPipeline,
+        scheduleBeginPipeline,
+        scheduleCollectPipeline,
+        scheduleFinishPipeline,
+        kickPipeline,
         mergePipeline,
         renderPipeline,
-        computeBindGroupLayout,
-        renderBindGroupLayout,
       };
       backend = created;
       configureCanvas();
@@ -476,7 +532,7 @@ export const initGalaxyEngine = () => {
       );
       // Accuracy readback is opt-in through the dedicated test-server query.
       // Normal development never imports or executes the O(n²) reference path.
-      if (import.meta.env.MODE === "galaxy-test") {
+      if (import.meta.env.PUBLIC_GALAXY_TEST_MODE === "true") {
         const solver = new URLSearchParams(location.search).get("solverAccuracy");
         if (solver === "all-pairs" || solver === "barnes-hut") {
           void import("./galaxySolverAccuracy").then(async ({ runGalaxySolverAccuracy }) => {
@@ -521,18 +577,35 @@ export const initGalaxyEngine = () => {
     const { parameters } = initial;
     view.setFloat32(0, parameters.timeStep, true);
     view.setFloat32(4, parameters.gravity, true);
-    view.setFloat32(8, 0, true);
+    view.setFloat32(8, TIMESTEP_ETA, true);
     view.setFloat32(12, parameters.captureSofteningFactor, true);
     view.setUint32(16, parameters.particleCount, true);
     view.setUint32(20, parameters.core1Index, true);
     view.setUint32(24, parameters.core2Index, true);
-    view.setUint32(28, 0, true);
+    view.setUint32(28, MAX_TIME_BIN, true);
     return new Uint8Array(data);
   };
 
   const buildGalaxy = async (generation: number) => {
     const activeBackend = await initializeBackend();
     if (disposed || generation !== buildGeneration) return;
+    const requestedParticleCount = currentTextureWidth ** 2;
+    if (currentSolverKind === "barnes-hut") {
+      const memory = calculateBarnesHutMemoryLayout(requestedParticleCount);
+      const bufferLimit = Math.min(
+        Number(activeBackend.device.limits.maxBufferSize),
+        Number(activeBackend.device.limits.maxStorageBufferBindingSize),
+      );
+      if (memory.largestBufferBytes > bufferLimit) {
+        throw new Error(
+          `${currentTextureWidth}x${currentTextureWidth} needs a ${
+            (memory.largestBufferBytes / 2 ** 20).toFixed(0)
+          } MiB tree buffer, above this GPU's ${
+            (bufferLimit / 2 ** 20).toFixed(0)
+          } MiB WebGPU limit.`,
+        );
+      }
+    }
     dispatchStatus("initializing", "Building deterministic galaxy state…");
     const initial = createGalaxyInitialState({
       textureWidth: currentTextureWidth,
@@ -562,22 +635,59 @@ export const initGalaxyEngine = () => {
         initial.parameters.particleCount * ACCELERATION_BYTES_PER_PARTICLE,
       usage: GPUBufferUsage.STORAGE,
     });
+    const timestepBuffer = device.createBuffer({
+      label: "Galaxy per-particle timestep state",
+      size: initial.parameters.particleCount * TIMESTEP_STATE_BYTES,
+      usage: GPUBufferUsage.STORAGE,
+    });
+    const activeIndicesBuffer = createBufferWithData(
+      device,
+      "Galaxy active particle indices",
+      createInitialActiveIndices(initial.parameters.particleCount),
+      GPUBufferUsage.STORAGE,
+    );
+    const adaptiveControlBuffer = createBufferWithData(
+      device,
+      "Galaxy adaptive timestep control",
+      createInitialAdaptiveControl(initial.parameters.particleCount),
+      GPUBufferUsage.STORAGE,
+    );
+    const indirectDispatchBuffer = createBufferWithData(
+      device,
+      "Galaxy active indirect dispatch",
+      createInitialIndirectDispatch(initial.parameters.particleCount),
+      GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT,
+    );
     const solver = await SOLVER_FACTORIES[currentSolverKind]({
       device,
       initial,
       stateBuffers,
       accelerationBuffer,
+      activeIndicesBuffer,
+      adaptiveControlBuffer,
+      indirectDispatchBuffer,
     });
     if (disposed || generation !== buildGeneration) {
       solver.destroy();
       accelerationBuffer.destroy();
+      timestepBuffer.destroy();
+      activeIndicesBuffer.destroy();
+      adaptiveControlBuffer.destroy();
+      indirectDispatchBuffer.destroy();
       stateBuffers.forEach((buffer) => buffer.destroy());
       return;
     }
+    const renderSample = createRenderSample(initial.visuals);
     const visualBuffer = createBufferWithData(
       device,
       "Galaxy particle visuals",
-      initial.visuals,
+      renderSample.visuals,
+      GPUBufferUsage.STORAGE,
+    );
+    const renderIndexBuffer = createBufferWithData(
+      device,
+      "Galaxy luminous render indices",
+      renderSample.indices,
       GPUBufferUsage.STORAGE,
     );
     const parameterBuffer = createBufferWithData(
@@ -593,6 +703,11 @@ export const initGalaxyEngine = () => {
       initial.state[core2Offset + 1]! - initial.state[core1Offset + 1]!,
       initial.state[core2Offset + 2]! - initial.state[core1Offset + 2]!,
     );
+    // The GPU owns the packed state from here. Release large CPU initialization
+    // arrays so million-body configurations do not retain a duplicate copy.
+    initial.state = new Float32Array(0);
+    initial.metadata = new Uint32Array(0);
+    initial.visuals = new Float32Array(0);
     const telemetryData = new ArrayBuffer(TELEMETRY_BYTES);
     new DataView(telemetryData).setFloat32(0, initialCoreSeparation, true);
     const telemetryBuffer = createBufferWithData(
@@ -618,27 +733,95 @@ export const initGalaxyEngine = () => {
       size: 80,
       usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
     });
-    const computeBindGroups = stateBuffers.map((sourceBuffer, index) =>
+    const initializeBindGroups = stateBuffers.map((sourceBuffer, index) =>
       device.createBindGroup({
-        label: `Galaxy compute ${index}`,
-        layout: activeBackend.computeBindGroupLayout,
+        label: `Galaxy adaptive initialization ${index}`,
+        layout: activeBackend.initializePipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: sourceBuffer } },
+          { binding: 1, resource: { buffer: stateBuffers[1 - index]! } },
+          { binding: 2, resource: { buffer: parameterBuffer } },
+          { binding: 3, resource: { buffer: accelerationBuffer } },
+          { binding: 4, resource: { buffer: timestepBuffer } },
+        ],
+      }),
+    ) as [GPUBindGroup, GPUBindGroup];
+    const driftBindGroups = stateBuffers.map((sourceBuffer, index) =>
+      device.createBindGroup({
+        label: `Galaxy drift ${index}`,
+        layout: activeBackend.driftPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: sourceBuffer } },
+          { binding: 1, resource: { buffer: stateBuffers[1 - index]! } },
+          { binding: 2, resource: { buffer: parameterBuffer } },
+        ],
+      }),
+    ) as [GPUBindGroup, GPUBindGroup];
+    const scheduleBeginBindGroup = device.createBindGroup({
+      label: "Galaxy begin active schedule",
+      layout: activeBackend.scheduleBeginPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 3, resource: { buffer: adaptiveControlBuffer } },
+        { binding: 4, resource: { buffer: indirectDispatchBuffer } },
+      ],
+    });
+    const scheduleCollectBindGroups = stateBuffers.map((stateBuffer, index) =>
+      device.createBindGroup({
+        label: `Galaxy collect active state ${index}`,
+        layout: activeBackend.scheduleCollectPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: stateBuffer } },
+          { binding: 1, resource: { buffer: timestepBuffer } },
+          { binding: 2, resource: { buffer: activeIndicesBuffer } },
+          { binding: 3, resource: { buffer: adaptiveControlBuffer } },
+          { binding: 5, resource: { buffer: parameterBuffer } },
+        ],
+      }),
+    ) as [GPUBindGroup, GPUBindGroup];
+    const scheduleFinishBindGroup = device.createBindGroup({
+      label: "Galaxy finish active schedule",
+      layout: activeBackend.scheduleFinishPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 3, resource: { buffer: adaptiveControlBuffer } },
+        { binding: 4, resource: { buffer: indirectDispatchBuffer } },
+        { binding: 5, resource: { buffer: parameterBuffer } },
+      ],
+    });
+    const kickBindGroups = stateBuffers.map((stateBuffer, index) =>
+      device.createBindGroup({
+        label: `Galaxy adaptive kick state ${index}`,
+        layout: activeBackend.kickPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: stateBuffer } },
+          { binding: 1, resource: { buffer: accelerationBuffer } },
+          { binding: 2, resource: { buffer: timestepBuffer } },
+          { binding: 3, resource: { buffer: activeIndicesBuffer } },
+          { binding: 4, resource: { buffer: adaptiveControlBuffer } },
+          { binding: 5, resource: { buffer: parameterBuffer } },
+        ],
+      }),
+    ) as [GPUBindGroup, GPUBindGroup];
+    const mergeBindGroups = stateBuffers.map((sourceBuffer, index) =>
+      device.createBindGroup({
+        label: `Galaxy merge state ${index}`,
+        layout: activeBackend.mergePipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: sourceBuffer } },
           { binding: 1, resource: { buffer: stateBuffers[1 - index]! } },
           { binding: 2, resource: { buffer: parameterBuffer } },
           { binding: 3, resource: { buffer: telemetryBuffer } },
-          { binding: 4, resource: { buffer: accelerationBuffer } },
         ],
       }),
     ) as [GPUBindGroup, GPUBindGroup];
     const renderBindGroups = stateBuffers.map((stateBuffer, index) =>
       device.createBindGroup({
         label: `Galaxy render ${index}`,
-        layout: activeBackend.renderBindGroupLayout,
+        layout: activeBackend.renderPipeline.getBindGroupLayout(0),
         entries: [
           { binding: 0, resource: { buffer: stateBuffer } },
           { binding: 1, resource: { buffer: visualBuffer } },
           { binding: 2, resource: { buffer: renderParameterBuffer } },
+          { binding: 3, resource: { buffer: renderIndexBuffer } },
         ],
       }),
     ) as [GPUBindGroup, GPUBindGroup];
@@ -651,13 +834,13 @@ export const initGalaxyEngine = () => {
       label: "Galaxy leapfrog half-step initialization pass",
     });
     initializationPass.setPipeline(activeBackend.initializePipeline);
-    initializationPass.setBindGroup(0, computeBindGroups[0]);
+    initializationPass.setBindGroup(0, initializeBindGroups[0]);
     initializationPass.dispatchWorkgroups(
       Math.ceil(initial.parameters.particleCount / WORKGROUP_SIZE),
     );
     initializationPass.end();
-    // Seeded CPU velocities are full-step values. Run one half-kick before the
-    // first frame so every later state uses a consistent leapfrog convention.
+    // Seeded CPU velocities are full-step values. Each particle receives its
+    // own forward half-kick based on its first synchronized timestep bin.
     device.queue.submit([initializationEncoder.finish()]);
 
     const nextSimulation: SimulationResources = {
@@ -666,11 +849,23 @@ export const initGalaxyEngine = () => {
       visualBuffer,
       parameterBuffer,
       accelerationBuffer,
+      timestepBuffer,
+      activeIndicesBuffer,
+      adaptiveControlBuffer,
+      indirectDispatchBuffer,
       solver,
       telemetryBuffer,
       telemetryReadbacks,
       renderParameterBuffer,
-      computeBindGroups,
+      renderIndexBuffer,
+      renderCount: renderSample.indices.length,
+      initializeBindGroups,
+      driftBindGroups,
+      scheduleBeginBindGroup,
+      scheduleCollectBindGroups,
+      scheduleFinishBindGroup,
+      kickBindGroups,
+      mergeBindGroups,
       renderBindGroups,
       readIndex: 1,
       simulationTime: 0,
@@ -679,6 +874,10 @@ export const initGalaxyEngine = () => {
     };
     const previousSimulation = simulation;
     simulation = nextSimulation;
+    // A rebuild can finish while the previous simulation still has a queued
+    // submission. Its completion callback intentionally cannot mutate the new
+    // simulation, so explicitly release the new instance here.
+    physicsSubmissionPending = false;
     if (previousSimulation) {
       void device.queue.onSubmittedWorkDone().then(() =>
         destroySimulation(previousSimulation),
@@ -800,30 +999,54 @@ export const initGalaxyEngine = () => {
     });
     let renderIndex = activeSimulation.readIndex;
 
-    if (runPhysics) {
-      // One command encoder preserves ordering: solver -> leapfrog -> merge ->
-      // telemetry copy -> render. No CPU/GPU synchronization is needed here.
+    const advancePhysics = runPhysics && !physicsSubmissionPending;
+    if (advancePhysics) {
+      physicsSubmissionPending = true;
+      const sourceIndex = activeSimulation.readIndex;
+      const destinationIndex = (1 - sourceIndex) as PingPongIndex;
+      const particleWorkgroups = Math.ceil(
+        activeSimulation.initial.parameters.particleCount / WORKGROUP_SIZE,
+      );
+
+      // Drift every particle to the next synchronization point, then compact
+      // only particles whose power-of-two timestep expires at this tick.
+      const schedulePass = encoder.beginComputePass({
+        label: "Galaxy adaptive drift and active schedule",
+      });
+      schedulePass.setPipeline(backend.driftPipeline);
+      schedulePass.setBindGroup(0, activeSimulation.driftBindGroups[sourceIndex]);
+      schedulePass.dispatchWorkgroups(particleWorkgroups);
+      schedulePass.setPipeline(backend.scheduleBeginPipeline);
+      schedulePass.setBindGroup(0, activeSimulation.scheduleBeginBindGroup);
+      schedulePass.dispatchWorkgroups(1);
+      schedulePass.setPipeline(backend.scheduleCollectPipeline);
+      schedulePass.setBindGroup(
+        0,
+        activeSimulation.scheduleCollectBindGroups[destinationIndex],
+      );
+      schedulePass.dispatchWorkgroups(particleWorkgroups);
+      schedulePass.setPipeline(backend.scheduleFinishPipeline);
+      schedulePass.setBindGroup(0, activeSimulation.scheduleFinishBindGroup);
+      schedulePass.dispatchWorkgroups(1);
+      schedulePass.end();
+
+      // Tree construction still sees the complete current state. The expensive
+      // force traversal is dispatched only for the compact active target list.
       activeSimulation.solver.encode(
         encoder,
-        activeSimulation.readIndex,
+        destinationIndex,
       );
-      const computePass = encoder.beginComputePass({
-        label: "Galaxy leapfrog and merger pass",
+      const kickPass = encoder.beginComputePass({
+        label: "Galaxy adaptive kick and merger pass",
       });
-      computePass.setPipeline(backend.stepPipeline);
-      computePass.setBindGroup(
-        0,
-        activeSimulation.computeBindGroups[activeSimulation.readIndex],
-      );
-      computePass.dispatchWorkgroups(
-        Math.ceil(
-          activeSimulation.initial.parameters.particleCount / WORKGROUP_SIZE,
-        ),
-      );
-      computePass.setPipeline(backend.mergePipeline);
-      computePass.dispatchWorkgroups(1);
-      computePass.end();
-      renderIndex = (1 - activeSimulation.readIndex) as PingPongIndex;
+      kickPass.setPipeline(backend.kickPipeline);
+      kickPass.setBindGroup(0, activeSimulation.kickBindGroups[destinationIndex]);
+      kickPass.dispatchWorkgroupsIndirect(activeSimulation.indirectDispatchBuffer, 0);
+      kickPass.setPipeline(backend.mergePipeline);
+      kickPass.setBindGroup(0, activeSimulation.mergeBindGroups[sourceIndex]);
+      kickPass.dispatchWorkgroups(1);
+      kickPass.end();
+      renderIndex = destinationIndex;
       activeSimulation.readIndex = renderIndex;
       activeSimulation.simulationTime +=
         activeSimulation.initial.parameters.timeStep;
@@ -861,11 +1084,29 @@ export const initGalaxyEngine = () => {
     renderPass.setBindGroup(0, activeSimulation.renderBindGroups[renderIndex]);
     renderPass.draw(
       6,
-      activeSimulation.initial.parameters.particleCount,
+      activeSimulation.renderCount,
     );
     renderPass.end();
 
     backend.device.queue.submit([encoder.finish()]);
+    if (advancePhysics) {
+      const target = activeSimulation;
+      void backend.device.queue.onSubmittedWorkDone().then(() => {
+        if (simulation === target && !disposed) {
+          physicsSubmissionPending = false;
+        }
+      }).catch((error: unknown) => {
+        physicsSubmissionPending = false;
+        if (!disposed && simulation === target) {
+          dispatchStatus(
+            "error",
+            `WebGPU submission failed: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+      });
+    }
     if (telemetrySlot) {
       scheduleTelemetryReadback(activeSimulation, telemetrySlot);
     }
@@ -900,6 +1141,7 @@ export const initGalaxyEngine = () => {
     // Generation tokens discard stale async builds if a user moves a control
     // again before the previous rebuild finishes.
     const generation = ++buildGeneration;
+    physicsSubmissionPending = false;
     animateFizzle(0, () => {
       void buildGalaxy(generation)
         .then(() => {
@@ -950,9 +1192,10 @@ export const initGalaxyEngine = () => {
         .catch(() => dispatchFizzleComplete(true));
     } else {
       animateFizzle(0, () => {
-        if (simulation && backend) {
+      if (simulation && backend) {
           const previousSimulation = simulation;
           simulation = null;
+          physicsSubmissionPending = false;
           void backend.device.queue.onSubmittedWorkDone().then(() =>
             destroySimulation(previousSimulation),
           );

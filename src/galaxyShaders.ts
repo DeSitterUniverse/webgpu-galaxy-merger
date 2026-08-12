@@ -1,22 +1,20 @@
 export const WORKGROUP_SIZE = 128;
 
-export const galaxyComputeShader = /* wgsl */ `
-// Keep the storage layout aligned with the CPU's two-vec4 packed state.
-// Softening rides in velocity.w, so component-aware forces cost no extra buffer.
+export const galaxyMergeShader = /* wgsl */ `
 struct Particle {
   positionMass: vec4f,
   velocitySoftening: vec4f,
 };
 
 struct SimulationParameters {
-  timeStep: f32,
+  baseTimeStep: f32,
   gravity: f32,
-  paddingFloat: f32,
+  timestepEta: f32,
   captureSofteningFactor: f32,
   particleCount: u32,
   core1Index: u32,
   core2Index: u32,
-  padding: u32,
+  maximumTimeBin: u32,
 };
 
 struct CoreTelemetry {
@@ -30,60 +28,6 @@ struct CoreTelemetry {
 @group(0) @binding(1) var<storage, read_write> destination: array<Particle>;
 @group(0) @binding(2) var<uniform> parameters: SimulationParameters;
 @group(0) @binding(3) var<storage, read_write> telemetry: CoreTelemetry;
-@group(0) @binding(4) var<storage, read> accelerations: array<vec4f>;
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn initializeLeapfrog(
-  @builtin(global_invocation_id) globalId: vec3u,
-) {
-  let index = globalId.x;
-  if (index >= parameters.particleCount) {
-    return;
-  }
-  let particle = source[index];
-  if (particle.positionMass.w <= 0.0) {
-    destination[index] = particle;
-    return;
-  }
-  var initialized = particle;
-  // Convert full-step input velocities to the half-step representation used by
-  // kick-drift leapfrog. Normal frames then need only one force evaluation.
-  initialized.velocitySoftening = vec4f(
-    particle.velocitySoftening.xyz -
-      0.5 * accelerations[index].xyz * parameters.timeStep,
-    particle.velocitySoftening.w,
-  );
-  destination[index] = initialized;
-}
-
-@compute @workgroup_size(${WORKGROUP_SIZE})
-fn leapfrogStep(
-  @builtin(global_invocation_id) globalId: vec3u,
-) {
-  let index = globalId.x;
-  if (index >= parameters.particleCount) {
-    return;
-  }
-  let particle = source[index];
-  if (particle.positionMass.w <= 0.0) {
-    destination[index] = particle;
-    return;
-  }
-
-  // Kick velocity at the half step, then drift position with that velocity.
-  let nextHalfVelocity = particle.velocitySoftening.xyz +
-    accelerations[index].xyz * parameters.timeStep;
-  var nextParticle = particle;
-  nextParticle.velocitySoftening = vec4f(
-    nextHalfVelocity,
-    particle.velocitySoftening.w,
-  );
-  nextParticle.positionMass = vec4f(
-    particle.positionMass.xyz + nextHalfVelocity * parameters.timeStep,
-    particle.positionMass.w,
-  );
-  destination[index] = nextParticle;
-}
 
 @compute @workgroup_size(1)
 fn mergeCores() {
@@ -106,8 +50,6 @@ fn mergeCores() {
   let relativeMotion = newRelative - oldRelative;
   let denominator = dot(relativeMotion, relativeMotion);
   var closestFraction = 0.0;
-  // Find closest approach along this timestep's relative-motion segment. An
-  // endpoint-only check would let sufficiently fast cores tunnel through.
   if (denominator > 1e-12) {
     closestFraction = clamp(
       -dot(oldRelative, relativeMotion) / denominator,
@@ -134,8 +76,6 @@ fn mergeCores() {
     parameters.gravity * totalMass / softenedSeparation;
   let isBound = specificEnergy < 0.0;
 
-  // A close passage first becomes an unresolved bound binary. Flybys remain
-  // separate even when their swept paths cross the capture scale.
   if (telemetry.phase == 0u) {
     if (!isBound || !crossesCaptureRadius) {
       telemetry = CoreTelemetry(length(newRelative), 0u, 0.0, 0.0);
@@ -152,20 +92,18 @@ fn mergeCores() {
     telemetry = CoreTelemetry(
       length(newRelative),
       1u,
-      parameters.timeStep,
+      parameters.baseTimeStep,
       mergeDelay,
     );
     return;
   }
 
-  // If the pair escapes, discard the binary state. Otherwise wait for roughly
-  // one unresolved orbit and a qualifying close passage before coalescing.
   if (telemetry.phase == 1u) {
     if (!isBound) {
       telemetry = CoreTelemetry(length(newRelative), 0u, 0.0, 0.0);
       return;
     }
-    let boundElapsed = telemetry.boundElapsed + parameters.timeStep;
+    let boundElapsed = telemetry.boundElapsed + parameters.baseTimeStep;
     if (boundElapsed < telemetry.mergeDelay || !crossesCaptureRadius) {
       telemetry = CoreTelemetry(
         length(newRelative),
@@ -177,7 +115,6 @@ fn mergeCores() {
     }
   }
 
-  // Mass-weighted replacement conserves total mass, momentum, and core COM.
   let mergedPosition =
     (newCore1.positionMass.w * newCore1.positionMass.xyz +
      newCore2.positionMass.w * newCore2.positionMass.xyz) / totalMass;
@@ -195,7 +132,7 @@ fn mergeCores() {
   telemetry = CoreTelemetry(
     0.0,
     2u,
-    telemetry.boundElapsed + parameters.timeStep,
+    telemetry.boundElapsed + parameters.baseTimeStep,
     telemetry.mergeDelay,
   );
 }
@@ -227,10 +164,9 @@ struct VertexOutput {
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
 @group(0) @binding(1) var<storage, read> visuals: array<Visual>;
 @group(0) @binding(2) var<uniform> parameters: RenderParameters;
+@group(0) @binding(3) var<storage, read> renderIndices: array<u32>;
 
 fn particleHash(index: u32) -> f32 {
-  // A stable per-index hash makes fizzle transitions deterministic and avoids
-  // frame-to-frame particle sparkling.
   var value = index + 0x9e3779b9u;
   value = (value ^ (value >> 16u)) * 0x21f0aaadu;
   value = (value ^ (value >> 15u)) * 0x735a2d97u;
@@ -247,7 +183,8 @@ fn vertexMain(
     vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
     vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0),
   );
-  let particle = particles[instanceIndex];
+  let simulationIndex = renderIndices[instanceIndex];
+  let particle = particles[simulationIndex];
   let visual = visuals[instanceIndex];
   var output: VertexOutput;
   output.color = visual.colorSize.xyz;
@@ -255,13 +192,12 @@ fn vertexMain(
   if (
     particle.positionMass.w <= 0.0 ||
     visual.colorSize.w <= 0.0 ||
-    particleHash(instanceIndex) > parameters.fizzle
+    particleHash(simulationIndex) > parameters.fizzle
   ) {
     output.position = vec4f(2.0, 2.0, 2.0, 1.0);
     return output;
   }
 
-  // Expand each simulated point into a six-vertex camera-facing billboard.
   let center = parameters.viewProjection * vec4f(particle.positionMass.xyz, 1.0);
   let pixelSize = visual.colorSize.w * parameters.sizeScale /
     max(abs(center.w), 1.0) * mix(0.45, 1.0, parameters.fizzle);
@@ -272,12 +208,8 @@ fn vertexMain(
 
 @fragment
 fn fragmentMain(input: VertexOutput) -> @location(0) vec4f {
-  // Circular falloff plus additive blending produces a compact luminous point
-  // without storing a particle texture.
   let radius = length(input.local);
-  if (radius > 1.0) {
-    discard;
-  }
+  if (radius > 1.0) { discard; }
   let alpha = pow(1.0 - radius, 1.2);
   return vec4f(input.color * alpha, alpha);
 }

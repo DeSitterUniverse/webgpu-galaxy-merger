@@ -48,15 +48,6 @@ export type GalaxyInitialState = {
 };
 
 type Vec3 = [number, number, number];
-type Particle = {
-  position: Vec3;
-  velocity: Vec3;
-  mass: number;
-  softening: number;
-  metadata: number;
-  color: Vec3;
-  size: number;
-};
 
 // Simulation units are intentionally normalized: one galaxy has total mass 5,
 // which keeps the f32 GPU state well-conditioned while preserving mass ratios.
@@ -149,7 +140,7 @@ export const sanitizeGalaxySettings = (
     textureWidth: clamp(
       requestedWidth,
       MIN_LIVE_HALO_TEXTURE_WIDTH,
-      320,
+      1024,
     ),
     radius: clamp(finiteOr(settings.radius, 35), 15, 80),
     offset: clamp(finiteOr(settings.offset, 25), MIN_CENTER_OFFSET, 60),
@@ -637,43 +628,6 @@ const buildEquilibriumModel = (parameters: GalaxyParameters) => {
   return model;
 };
 
-const createDiskParticle = (
-  seed: number,
-  galaxy: number,
-  ordinal: number,
-  parameters: GalaxyParameters,
-  model: EquilibriumModel,
-): Particle => {
-  const radius = invertCumulative(
-    model.radii,
-    model.diskCumulative,
-    randomSample(seed, galaxy, ordinal, 20),
-  );
-  const angle = randomSample(seed, galaxy, ordinal, 1) * Math.PI * 2;
-  const verticalCoordinate = clamp(
-    2 * randomSample(seed, galaxy, ordinal, 2) - 1,
-    -0.995,
-    0.995,
-  );
-  const palette = GALAXY_COLORS[galaxy]!;
-  const color = palette[
-    Math.floor(randomSample(seed, galaxy, ordinal, 10) * palette.length)
-  ]!;
-  return {
-    position: [
-      Math.cos(angle) * radius,
-      parameters.radius * 0.035 * Math.atanh(verticalCoordinate),
-      Math.sin(angle) * radius,
-    ],
-    velocity: [0, 0, 0],
-    mass: DISK_MASS / parameters.diskParticlesPerGalaxy,
-    softening: parameters.diskSoftening,
-    metadata: galaxy === 1 ? META_GALAXY_TWO : 0,
-    color: [color[0], color[1], color[2]],
-    size: 2 + randomSample(seed, galaxy, ordinal, 11) * 5,
-  };
-};
-
 const isotropicDirection = (
   seed: number,
   galaxy: number,
@@ -685,60 +639,6 @@ const isotropicDirection = (
     randomSample(seed, galaxy, ordinal, channel + 1) * Math.PI * 2;
   const sine = Math.sqrt(Math.max(0, 1 - cosine * cosine));
   return [sine * Math.cos(angle), cosine, sine * Math.sin(angle)];
-};
-
-const createHaloParticle = (
-  seed: number,
-  galaxy: number,
-  ordinal: number,
-  parameters: GalaxyParameters,
-  model: EquilibriumModel,
-): Particle => {
-  const radius = invertCumulative(
-    model.radii,
-    model.haloCumulative,
-    randomSample(seed, galaxy, ordinal, 220),
-  );
-  const positionDirection = isotropicDirection(seed, galaxy, ordinal, 210);
-  return {
-    position: scale(positionDirection, radius),
-    velocity: [0, 0, 0],
-    mass: HALO_MASS / parameters.haloParticlesPerGalaxy,
-    softening: parameters.haloSoftening,
-    metadata: META_HALO | (galaxy === 1 ? META_GALAXY_TWO : 0),
-    // Halo bodies remain gravitationally live but are not luminous tracers.
-    color: [0, 0, 0],
-    size: 0,
-  };
-};
-
-const recenterComponentPositions = (particles: Particle[]) => {
-  let totalMass = 0;
-  let weightedPosition: Vec3 = [0, 0, 0];
-  for (const particle of particles) {
-    totalMass += particle.mass;
-    weightedPosition = add(
-      weightedPosition,
-      scale(particle.position, particle.mass),
-    );
-  }
-  const center = scale(weightedPosition, 1 / totalMass);
-  for (const particle of particles) {
-    particle.position = add(particle.position, scale(center, -1));
-  }
-};
-
-const removeComponentBulkVelocity = (particles: Particle[]) => {
-  let totalMass = 0;
-  let momentum: Vec3 = [0, 0, 0];
-  for (const particle of particles) {
-    totalMass += particle.mass;
-    momentum = add(momentum, scale(particle.velocity, particle.mass));
-  }
-  const bulkVelocity = scale(momentum, 1 / totalMass);
-  for (const particle of particles) {
-    particle.velocity = add(particle.velocity, scale(bulkVelocity, -1));
-  }
 };
 
 const diskRadialAcceleration = (
@@ -761,137 +661,185 @@ const diskRadialAcceleration = (
     interpolateTable(model.radii, model.diskAcceleration, radius);
 };
 
-const initializeDiskVelocities = (
-  particles: Particle[],
-  seed: number,
-  galaxy: number,
-  parameters: GalaxyParameters,
-  model: EquilibriumModel,
-) => {
-  particles.forEach((particle, ordinal) => {
-    const [x, , z] = particle.position;
-    const radius = Math.max(Math.hypot(x, z), Number.EPSILON);
-    const angle = Math.atan2(z, x);
-    const circularSpeed = Math.sqrt(
-      Math.max(0, diskRadialAcceleration(radius, parameters, model) * radius),
-    );
-    const radialDispersion =
-      gaussianSample(seed, galaxy, ordinal, 4) * circularSpeed * 0.035;
-    const tangentialDispersion =
-      gaussianSample(seed, galaxy, ordinal, 6) * circularSpeed * 0.02;
-    const verticalDispersion =
-      gaussianSample(seed, galaxy, ordinal, 8) * circularSpeed * 0.025;
-    const radial: Vec3 = [Math.cos(angle), 0, Math.sin(angle)];
-    const tangent: Vec3 = [-Math.sin(angle), 0, Math.cos(angle)];
-    particle.velocity = add(
-      add(
-        scale(radial, radialDispersion),
-        scale(tangent, circularSpeed + tangentialDispersion),
-      ),
-      [0, verticalDispersion, 0],
-    );
-  });
-};
-
-const initializeHaloVelocities = (
-  particles: Particle[],
-  seed: number,
-  galaxy: number,
-  model: EquilibriumModel,
-) => {
-  particles.forEach((particle, ordinal) => {
-    const radius = magnitude(particle.position);
-    const dispersion = Math.sqrt(Math.max(
-      0,
-      interpolateTable(model.radii, model.haloDispersionSquared, radius),
-    ));
-    const velocity: Vec3 = [
-      gaussianSample(seed, galaxy, ordinal, 300) * dispersion,
-      gaussianSample(seed, galaxy, ordinal, 302) * dispersion,
-      gaussianSample(seed, galaxy, ordinal, 304) * dispersion,
-    ];
-    const escapeSpeed = interpolateTable(model.radii, model.escapeSpeed, radius);
-    const speed = magnitude(velocity);
-    particle.velocity = speed > escapeSpeed * 0.95
-      ? scale(velocity, escapeSpeed * 0.95 / speed)
-      : velocity;
-  });
-};
-
 export const createGalaxyInitialState = (
   requestedSettings: GalaxySettings,
 ): GalaxyInitialState => {
   const { settings, parameters } = deriveGalaxyParameters(requestedSettings);
-  const galaxies: [Particle[], Particle[]] = [[], []];
   const model = buildEquilibriumModel(parameters);
   parameters.innerOrbitalPeriod = model.innerOrbitalPeriod;
   parameters.timeStep = Math.min(TIME_STEP, model.innerOrbitalPeriod / 48);
+  const state = new Float32Array(parameters.particleCount * 8);
+  const metadata = new Uint32Array(parameters.particleCount);
+  const visuals = new Float32Array(parameters.particleCount * 4);
 
-  // Particle zero in each half is the compact core, followed by disk then halo.
-  // Keeping that ordering deterministic gives shaders stable core indices.
+  const recenterPositions = (start: number, count: number, center: Vec3) => {
+    const inverseCount = 1 / count;
+    const correction = scale(center, inverseCount);
+    for (let ordinal = 0; ordinal < count; ordinal++) {
+      const offset = (start + ordinal) * 8;
+      state[offset] = state[offset]! - correction[0];
+      state[offset + 1] = state[offset + 1]! - correction[1];
+      state[offset + 2] = state[offset + 2]! - correction[2];
+    }
+  };
+
+  const removeBulkVelocity = (start: number, count: number, sum: Vec3) => {
+    const correction = scale(sum, 1 / count);
+    for (let ordinal = 0; ordinal < count; ordinal++) {
+      const offset = (start + ordinal) * 8 + 4;
+      state[offset] = state[offset]! - correction[0];
+      state[offset + 1] = state[offset + 1]! - correction[1];
+      state[offset + 2] = state[offset + 2]! - correction[2];
+    }
+  };
+
+  // Generate directly into packed arrays. The earlier object-per-particle
+  // representation consumed hundreds of megabytes before a million-body state
+  // ever reached WebGPU.
   for (let galaxy = 0; galaxy < 2; galaxy++) {
-    const particles = galaxies[galaxy]!;
-    const core: Particle = {
-      position: [0, 0, 0],
-      velocity: [0, 0, 0],
-      mass: CORE_MASS,
-      softening: parameters.coreSoftening,
-      metadata: META_CORE | (galaxy === 1 ? META_GALAXY_TWO : 0),
-      color: [1, 1, 1],
-      size: 10,
-    };
-    const disk: Particle[] = [];
-    const halo: Particle[] = [];
-    for (
-      let ordinal = 0;
-      ordinal < parameters.diskParticlesPerGalaxy;
-      ordinal++
-    ) {
-      disk.push(
-        createDiskParticle(
-          settings.seed,
-          galaxy,
-          ordinal,
-          parameters,
-          model,
-        ),
+    const galaxyStart = galaxy * parameters.particlesPerGalaxy;
+    const diskStart = galaxyStart + 1;
+    const haloStart = diskStart + parameters.diskParticlesPerGalaxy;
+    const galaxyMask = galaxy === 1 ? META_GALAXY_TWO : 0;
+    const coreOffset = galaxyStart * 8;
+    state[coreOffset + 3] = CORE_MASS;
+    state[coreOffset + 7] = parameters.coreSoftening;
+    metadata[galaxyStart] = META_CORE | galaxyMask;
+    visuals.set([1, 1, 1, 10], galaxyStart * 4);
+
+    let diskPositionSum: Vec3 = [0, 0, 0];
+    for (let ordinal = 0; ordinal < parameters.diskParticlesPerGalaxy; ordinal++) {
+      const radius = invertCumulative(
+        model.radii,
+        model.diskCumulative,
+        randomSample(settings.seed, galaxy, ordinal, 20),
       );
+      const angle = randomSample(settings.seed, galaxy, ordinal, 1) * Math.PI * 2;
+      const verticalCoordinate = clamp(
+        2 * randomSample(settings.seed, galaxy, ordinal, 2) - 1,
+        -0.995,
+        0.995,
+      );
+      const position: Vec3 = [
+        Math.cos(angle) * radius,
+        parameters.radius * 0.035 * Math.atanh(verticalCoordinate),
+        Math.sin(angle) * radius,
+      ];
+      diskPositionSum = add(diskPositionSum, position);
+      const particleIndex = diskStart + ordinal;
+      const offset = particleIndex * 8;
+      state.set(position, offset);
+      state[offset + 3] = DISK_MASS / parameters.diskParticlesPerGalaxy;
+      state[offset + 7] = parameters.diskSoftening;
+      metadata[particleIndex] = galaxyMask;
+      const palette = GALAXY_COLORS[galaxy]!;
+      const color = palette[
+        Math.floor(randomSample(settings.seed, galaxy, ordinal, 10) * palette.length)
+      ]!;
+      visuals.set([
+        color[0],
+        color[1],
+        color[2],
+        2 + randomSample(settings.seed, galaxy, ordinal, 11) * 5,
+      ], particleIndex * 4);
     }
-    for (
-      let ordinal = 0;
-      ordinal < parameters.haloParticlesPerGalaxy;
-      ordinal++
-    ) {
-      halo.push(
-        createHaloParticle(
-          settings.seed,
-          galaxy,
-          ordinal,
-          parameters,
-          model,
-        ),
+    recenterPositions(
+      diskStart,
+      parameters.diskParticlesPerGalaxy,
+      diskPositionSum,
+    );
+
+    let diskVelocitySum: Vec3 = [0, 0, 0];
+    for (let ordinal = 0; ordinal < parameters.diskParticlesPerGalaxy; ordinal++) {
+      const particleIndex = diskStart + ordinal;
+      const offset = particleIndex * 8;
+      const x = state[offset]!;
+      const z = state[offset + 2]!;
+      const radius = Math.max(Math.hypot(x, z), Number.EPSILON);
+      const angle = Math.atan2(z, x);
+      const circularSpeed = Math.sqrt(
+        Math.max(0, diskRadialAcceleration(radius, parameters, model) * radius),
       );
+      const radialDispersion =
+        gaussianSample(settings.seed, galaxy, ordinal, 4) * circularSpeed * 0.035;
+      const tangentialSpeed = circularSpeed +
+        gaussianSample(settings.seed, galaxy, ordinal, 6) * circularSpeed * 0.02;
+      const velocity: Vec3 = [
+        Math.cos(angle) * radialDispersion - Math.sin(angle) * tangentialSpeed,
+        gaussianSample(settings.seed, galaxy, ordinal, 8) * circularSpeed * 0.025,
+        Math.sin(angle) * radialDispersion + Math.cos(angle) * tangentialSpeed,
+      ];
+      state.set(velocity, offset + 4);
+      diskVelocitySum = add(diskVelocitySum, velocity);
+    }
+    removeBulkVelocity(
+      diskStart,
+      parameters.diskParticlesPerGalaxy,
+      diskVelocitySum,
+    );
+    for (let ordinal = 0; ordinal < parameters.diskParticlesPerGalaxy; ordinal++) {
+      const offset = (diskStart + ordinal) * 8;
+      const position = rotateDiskVector([
+        state[offset]!, state[offset + 1]!, state[offset + 2]!,
+      ], galaxy);
+      const velocity = rotateDiskVector([
+        state[offset + 4]!, state[offset + 5]!, state[offset + 6]!,
+      ], galaxy);
+      state.set(position, offset);
+      state.set(velocity, offset + 4);
     }
 
-    // Center each independently before velocities are calculated. This keeps
-    // finite-N halo noise from translating the disk away from its core.
-    recenterComponentPositions(disk);
-    recenterComponentPositions(halo);
-    initializeDiskVelocities(
-      disk,
-      settings.seed,
-      galaxy,
-      parameters,
-      model,
-    );
-    initializeHaloVelocities(halo, settings.seed, galaxy, model);
-    removeComponentBulkVelocity(disk);
-    removeComponentBulkVelocity(halo);
-    for (const particle of disk) {
-      particle.position = rotateDiskVector(particle.position, galaxy);
-      particle.velocity = rotateDiskVector(particle.velocity, galaxy);
+    let haloPositionSum: Vec3 = [0, 0, 0];
+    for (let ordinal = 0; ordinal < parameters.haloParticlesPerGalaxy; ordinal++) {
+      const radius = invertCumulative(
+        model.radii,
+        model.haloCumulative,
+        randomSample(settings.seed, galaxy, ordinal, 220),
+      );
+      const position = scale(
+        isotropicDirection(settings.seed, galaxy, ordinal, 210),
+        radius,
+      );
+      haloPositionSum = add(haloPositionSum, position);
+      const particleIndex = haloStart + ordinal;
+      const offset = particleIndex * 8;
+      state.set(position, offset);
+      state[offset + 3] = HALO_MASS / parameters.haloParticlesPerGalaxy;
+      state[offset + 7] = parameters.haloSoftening;
+      metadata[particleIndex] = META_HALO | galaxyMask;
     }
-    particles.push(core, ...disk, ...halo);
+    recenterPositions(
+      haloStart,
+      parameters.haloParticlesPerGalaxy,
+      haloPositionSum,
+    );
+
+    let haloVelocitySum: Vec3 = [0, 0, 0];
+    for (let ordinal = 0; ordinal < parameters.haloParticlesPerGalaxy; ordinal++) {
+      const offset = (haloStart + ordinal) * 8;
+      const radius = Math.hypot(state[offset]!, state[offset + 1]!, state[offset + 2]!);
+      const dispersion = Math.sqrt(Math.max(
+        0,
+        interpolateTable(model.radii, model.haloDispersionSquared, radius),
+      ));
+      let velocity: Vec3 = [
+        gaussianSample(settings.seed, galaxy, ordinal, 300) * dispersion,
+        gaussianSample(settings.seed, galaxy, ordinal, 302) * dispersion,
+        gaussianSample(settings.seed, galaxy, ordinal, 304) * dispersion,
+      ];
+      const escapeSpeed = interpolateTable(model.radii, model.escapeSpeed, radius);
+      const speed = magnitude(velocity);
+      if (speed > escapeSpeed * 0.95) {
+        velocity = scale(velocity, escapeSpeed * 0.95 / speed);
+      }
+      state.set(velocity, offset + 4);
+      haloVelocitySum = add(haloVelocitySum, velocity);
+    }
+    removeBulkVelocity(
+      haloStart,
+      parameters.haloParticlesPerGalaxy,
+      haloVelocitySum,
+    );
   }
 
   const centers: [Vec3, Vec3] = [
@@ -928,36 +876,19 @@ export const createGalaxyInitialState = (
     scale(centerVelocityOne, -1),
   ];
 
-  const particles = [...galaxies[0], ...galaxies[1]];
   for (let galaxy = 0; galaxy < 2; galaxy++) {
-    for (const particle of galaxies[galaxy]!) {
-      particle.position = add(particle.position, centers[galaxy]!);
-      particle.velocity = add(particle.velocity, centerVelocities[galaxy]!);
+    const start = galaxy * parameters.particlesPerGalaxy;
+    const end = start + parameters.particlesPerGalaxy;
+    for (let particleIndex = start; particleIndex < end; particleIndex++) {
+      const offset = particleIndex * 8;
+      state[offset] = state[offset]! + centers[galaxy]![0];
+      state[offset + 1] = state[offset + 1]! + centers[galaxy]![1];
+      state[offset + 2] = state[offset + 2]! + centers[galaxy]![2];
+      state[offset + 4] = state[offset + 4]! + centerVelocities[galaxy]![0];
+      state[offset + 5] = state[offset + 5]! + centerVelocities[galaxy]![1];
+      state[offset + 6] = state[offset + 6]! + centerVelocities[galaxy]![2];
     }
   }
-
-  const state = new Float32Array(parameters.particleCount * 8);
-  const metadata = new Uint32Array(parameters.particleCount);
-  const visuals = new Float32Array(parameters.particleCount * 4);
-  particles.forEach((particle, index) => {
-    // Two vec4 values match the WGSL Particle layout exactly:
-    // position+mass, then velocity+per-particle softening.
-    const stateOffset = index * 8;
-    state[stateOffset] = particle.position[0];
-    state[stateOffset + 1] = particle.position[1];
-    state[stateOffset + 2] = particle.position[2];
-    state[stateOffset + 3] = particle.mass;
-    state[stateOffset + 4] = particle.velocity[0];
-    state[stateOffset + 5] = particle.velocity[1];
-    state[stateOffset + 6] = particle.velocity[2];
-    state[stateOffset + 7] = particle.softening;
-    metadata[index] = particle.metadata;
-    const visualOffset = index * 4;
-    visuals[visualOffset] = particle.color[0];
-    visuals[visualOffset + 1] = particle.color[1];
-    visuals[visualOffset + 2] = particle.color[2];
-    visuals[visualOffset + 3] = particle.size;
-  });
 
   return { settings, parameters, state, metadata, visuals };
 };

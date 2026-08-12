@@ -8,14 +8,44 @@ import { WORKGROUP_SIZE } from "./galaxyShaders";
 const TREE_NODE_STRIDE = 32;
 const TREE_CHILD_STRIDE = 32;
 const MINIMUM_TREE_HALF_EXTENT = 128;
+export const FULL_TREE_REBUILD_INTERVAL = 4;
 
-// Depth seven keeps leaf occupancy low through the interactive ceiling while
-// avoiding an unnecessary traversal level for every target particle.
+// Deeper trees keep dense terminal buckets bounded as resolution rises. Nine
+// levels are the maximum supported by the packed 9-bit cell coordinates.
 export const chooseTreeDepth = (particleCount: number) =>
-  particleCount > 256 ** 2 ? 8 : 7;
+  particleCount > 512 ** 2 ? 9 : particleCount > 256 ** 2 ? 8 : 7;
 
-export const maximumTreeNodeCount = (particleCount: number, depth: number) =>
-  1 + particleCount * depth;
+// At each level there can be no more occupied cells than particles or cells.
+// This exact upper bound replaces the old N*depth reservation and remains
+// safe even for highly clustered or nearly coincident particle layouts.
+export const maximumTreeNodeCount = (particleCount: number, depth: number) => {
+  let nodes = 1;
+  let cells = 1;
+  for (let level = 1; level <= depth; level++) {
+    cells *= 8;
+    nodes += Math.min(particleCount, cells);
+  }
+  return nodes;
+};
+
+export const calculateBarnesHutMemoryLayout = (particleCount: number) => {
+  const depth = chooseTreeDepth(particleCount);
+  const maximumNodes = maximumTreeNodeCount(particleCount, depth);
+  const buffers = {
+    nodes: maximumNodes * TREE_NODE_STRIDE,
+    children: maximumNodes * TREE_CHILD_STRIDE,
+    particlePaths: particleCount * depth * 4,
+    leafHeads: maximumNodes * 4,
+    particleNext: particleCount * 4,
+  };
+  return {
+    depth,
+    maximumNodes,
+    buffers,
+    largestBufferBytes: Math.max(...Object.values(buffers)),
+    totalBytes: Object.values(buffers).reduce((sum, size) => sum + size, 0),
+  };
+};
 
 const createBuildShader = (treeDepth: number) => /* wgsl */ `
 struct Particle {
@@ -32,7 +62,7 @@ struct TreeNode {
   momentZ: f32,
   softeningMoment: f32,
   packedCell: u32,
-  packedParent: u32,
+  parent: u32,
   owner: u32,
 };
 
@@ -86,11 +116,6 @@ fn targetLeaf(position: vec3f) -> vec3u {
   return vec3u(normalized * f32(1u << TREE_DEPTH));
 }
 
-fn levelBase(level: u32) -> u32 {
-  if (level == 0u) { return 0u; }
-  return 1u + (level - 1u) * parameters.particleCount;
-}
-
 fn packCell(depth: u32, cell: vec3u) -> u32 {
   return (depth << 27u) | (cell.z << 18u) | (cell.y << 9u) | cell.x;
 }
@@ -109,11 +134,7 @@ fn initializeNode(
   nodes[index].momentZ = 0.0;
   nodes[index].softeningMoment = 0.0;
   nodes[index].packedCell = packCell(depth, cell);
-  nodes[index].packedParent = select(
-    parent | (childSlot << 20u),
-    EMPTY,
-    parent == EMPTY,
-  );
+  nodes[index].parent = parent;
   nodes[index].owner = owner;
   for (var child = 0u; child < 8u; child++) {
     atomicStore(&nodeChildren[index * 8u + child], EMPTY);
@@ -125,6 +146,8 @@ fn initializeNode(
 fn resetBuild(@builtin(global_invocation_id) globalId: vec3u) {
   if (globalId.x != 0u) { return; }
   atomicStore(&control[0], 0u);
+  atomicStore(&control[1], 1u);
+  atomicStore(&control[2], 0u);
   initializeNode(0u, EMPTY, 0u, vec3u(0u), 0u, 0u);
 }
 
@@ -141,12 +164,18 @@ fn measureBounds(@builtin(global_invocation_id) globalId: vec3u) {
   atomicMax(&control[0], u32(ceil(maximum * BOUNDS_SCALE)));
 }
 
-// Each child slot elects the lowest particle index. A separate dispatch turns
-// that stable winner into a node, avoiding scheduler-dependent spin locks.
+@compute @workgroup_size(1)
+fn finalizeBounds() {
+  nodes[0].owner = bitcast<u32>(treeHalfExtent());
+}
+
+// Each child slot elects the lowest particle index. Allocation and path
+// resolution use separate dispatches so node indices can be compact.
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn claimTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
   let particleIndex = globalId.x;
   if (particleIndex >= parameters.particleCount) { return; }
+  if (particles[particleIndex].positionMass.w <= 0.0) { return; }
   let level = parameters.currentLevel;
   let leaf = targetLeaf(particles[particleIndex].positionMass.xyz);
   let shift = TREE_DEPTH - level;
@@ -155,6 +184,7 @@ fn claimTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
   if (level > 1u) {
     parent = particleNodes[(level - 2u) * parameters.particleCount + particleIndex];
   }
+  if (parent == EMPTY) { return; }
   let childSlot = (cell.x & 1u) | ((cell.y & 1u) << 1u) |
     ((cell.z & 1u) << 2u);
   let childAddress = parent * 8u + childSlot;
@@ -165,6 +195,7 @@ fn claimTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
 fn finalizeTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
   let particleIndex = globalId.x;
   if (particleIndex >= parameters.particleCount) { return; }
+  if (particles[particleIndex].positionMass.w <= 0.0) { return; }
   let level = parameters.currentLevel;
   let leaf = targetLeaf(particles[particleIndex].positionMass.xyz);
   let shift = TREE_DEPTH - level;
@@ -173,36 +204,53 @@ fn finalizeTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
   if (level > 1u) {
     parent = particleNodes[(level - 2u) * parameters.particleCount + particleIndex];
   }
+  if (parent == EMPTY) { return; }
   let childSlot = (cell.x & 1u) | ((cell.y & 1u) << 1u) |
     ((cell.z & 1u) << 2u);
   let childAddress = parent * 8u + childSlot;
   let owner = atomicLoad(&nodeChildren[childAddress]);
-  let childNode = levelBase(level) + owner;
   if (owner == particleIndex) {
-    initializeNode(childNode, parent, level, cell, childSlot, owner);
+    let childNode = atomicAdd(&control[1], 1u);
+    if (childNode < parameters.maximumNodes) {
+      initializeNode(childNode, parent, level, cell, childSlot, owner);
+      atomicStore(&nodeChildren[childAddress], childNode);
+    } else {
+      atomicStore(&control[2], 1u);
+      atomicStore(&nodeChildren[childAddress], EMPTY);
+    }
   }
-  particleNodes[(level - 1u) * parameters.particleCount + particleIndex] = childNode;
 }
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
-fn publishTreeTopology(@builtin(global_invocation_id) globalId: vec3u) {
+fn resolveTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
   let particleIndex = globalId.x;
   if (particleIndex >= parameters.particleCount) { return; }
-  for (var level = 1u; level <= TREE_DEPTH; level++) {
-    let node = particleNodes[(level - 1u) * parameters.particleCount + particleIndex];
-    if (nodes[node].owner != particleIndex) { continue; }
-    let packedParent = nodes[node].packedParent;
-    let parent = packedParent & 0x000fffffu;
-    let childSlot = (packedParent >> 20u) & 7u;
-    atomicStore(&nodeChildren[parent * 8u + childSlot], node);
+  let level = parameters.currentLevel;
+  if (particles[particleIndex].positionMass.w <= 0.0) {
+    particleNodes[(level - 1u) * parameters.particleCount + particleIndex] = EMPTY;
+    return;
   }
+  let leaf = targetLeaf(particles[particleIndex].positionMass.xyz);
+  let shift = TREE_DEPTH - level;
+  let cell = leaf >> vec3u(shift);
+  var parent = 0u;
+  if (level > 1u) {
+    parent = particleNodes[(level - 2u) * parameters.particleCount + particleIndex];
+  }
+  if (parent == EMPTY) { return; }
+  let childSlot = (cell.x & 1u) | ((cell.y & 1u) << 1u) |
+    ((cell.z & 1u) << 2u);
+  particleNodes[(level - 1u) * parameters.particleCount + particleIndex] =
+    atomicLoad(&nodeChildren[parent * 8u + childSlot]);
 }
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn linkLeafParticles(@builtin(global_invocation_id) globalId: vec3u) {
   let particleIndex = globalId.x;
   if (particleIndex >= parameters.particleCount) { return; }
+  if (particles[particleIndex].positionMass.w <= 0.0) { return; }
   let leaf = particleNodes[(TREE_DEPTH - 1u) * parameters.particleCount + particleIndex];
+  if (leaf == EMPTY) { return; }
   particleNext[particleIndex] = atomicExchange(&leafHeads[leaf], particleIndex);
 }
 
@@ -211,12 +259,17 @@ fn aggregateTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
   let particleIndex = globalId.x;
   let level = parameters.currentLevel;
   if (particleIndex >= parameters.particleCount) { return; }
-  if (level == 0u && particleIndex > 0u) { return; }
-  let nodeIndex = select(0u, levelBase(level) + particleIndex, level > 0u);
-  if (nodes[nodeIndex].owner != particleIndex) { return; }
+  var nodeIndex = 0u;
+  if (level > 0u) {
+    nodeIndex = particleNodes[(level - 1u) * parameters.particleCount + particleIndex];
+    if (nodeIndex == EMPTY || nodes[nodeIndex].owner != particleIndex) { return; }
+  } else if (particleIndex > 0u) {
+    return;
+  }
   var mass = 0.0;
   var moment = vec3f(0.0);
   var softeningMoment = 0.0;
+  var particleCount = 0u;
 
   if (level == TREE_DEPTH) {
     var sourceIndex = atomicLoad(&leafHeads[nodeIndex]);
@@ -224,6 +277,7 @@ fn aggregateTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
       if (sourceIndex == EMPTY) { break; }
       let source = particles[sourceIndex];
       if (source.positionMass.w > 0.0) {
+        particleCount++;
         mass += source.positionMass.w;
         moment += source.positionMass.w * source.positionMass.xyz;
         softeningMoment += source.positionMass.w * source.velocitySoftening.w *
@@ -246,6 +300,11 @@ fn aggregateTreeLevel(@builtin(global_invocation_id) globalId: vec3u) {
   nodes[nodeIndex].momentY = moment.y;
   nodes[nodeIndex].momentZ = moment.z;
   nodes[nodeIndex].softeningMoment = softeningMoment;
+  // Parent links are only needed while constructing the topology. Reuse the
+  // field afterward to expose terminal occupancy to the traversal shader.
+  if (level == TREE_DEPTH) {
+    nodes[nodeIndex].parent = particleCount;
+  }
 }
 
 `;
@@ -263,7 +322,7 @@ struct TreeNode {
   momentZ: f32,
   softeningMoment: f32,
   packedCell: u32,
-  packedParent: u32,
+  parent: u32,
   owner: u32,
 };
 
@@ -281,15 +340,17 @@ struct TreeParameters {
 @group(0) @binding(0) var<storage, read> particles: array<Particle>;
 @group(0) @binding(1) var<storage, read_write> accelerations: array<vec4f>;
 @group(0) @binding(2) var<storage, read> nodes: array<TreeNode>;
-@group(0) @binding(3) var<storage, read_write> nodeChildren: array<atomic<u32>>;
-@group(0) @binding(4) var<storage, read_write> leafHeads: array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read> nodeChildren: array<u32>;
+@group(0) @binding(4) var<storage, read> leafHeads: array<u32>;
 @group(0) @binding(5) var<storage, read> particleNext: array<u32>;
-@group(0) @binding(6) var<storage, read> control: array<u32>;
-@group(0) @binding(7) var<uniform> parameters: TreeParameters;
+@group(0) @binding(6) var<storage, read> activeIndices: array<u32>;
+@group(0) @binding(7) var<storage, read> adaptiveControl: array<u32>;
+@group(0) @binding(8) var<uniform> parameters: TreeParameters;
 
 const TREE_DEPTH = ${treeDepth}u;
 const EMPTY = 0xffffffffu;
 const BOUNDS_SCALE = 1024.0;
+const DENSE_LEAF_DIRECT_LIMIT = 64u;
 
 fn nextPowerOfTwo(value: u32) -> u32 {
   var result = max(value, 1u) - 1u;
@@ -302,9 +363,7 @@ fn nextPowerOfTwo(value: u32) -> u32 {
 }
 
 fn treeHalfExtent() -> f32 {
-  let measured = f32(control[0]) / BOUNDS_SCALE;
-  let padded = u32(ceil(measured + 8.0));
-  return max(parameters.minimumHalfExtent, f32(nextPowerOfTwo(padded)));
+  return bitcast<f32>(nodes[0].owner);
 }
 
 fn targetLeaf(position: vec3f, halfExtent: f32) -> vec3u {
@@ -330,7 +389,7 @@ fn particleAcceleration(targetParticle: Particle, source: Particle) -> vec3f {
 
 fn exactLeafAcceleration(targetIndex: u32, targetParticle: Particle, nodeIndex: u32) -> vec3f {
   var acceleration = vec3f(0.0);
-  var sourceIndex = atomicLoad(&leafHeads[nodeIndex]);
+  var sourceIndex = leafHeads[nodeIndex];
   loop {
     if (sourceIndex == EMPTY) { break; }
     if (sourceIndex != targetIndex) {
@@ -358,6 +417,28 @@ fn monopoleAcceleration(targetParticle: Particle, node: TreeNode) -> vec3f {
     inverseDistance * inverseDistance * inverseDistance;
 }
 
+fn monopoleAccelerationExcludingTarget(targetParticle: Particle, node: TreeNode) -> vec3f {
+  let remainingMass = node.mass - targetParticle.positionMass.w;
+  if (remainingMass <= 0.0) { return vec3f(0.0); }
+  let remainingMoment = vec3f(node.momentX, node.momentY, node.momentZ) -
+    targetParticle.positionMass.w * targetParticle.positionMass.xyz;
+  let targetSofteningSquared = targetParticle.velocitySoftening.w *
+    targetParticle.velocitySoftening.w;
+  let remainingSofteningMoment = max(
+    node.softeningMoment - targetParticle.positionMass.w * targetSofteningSquared,
+    0.0,
+  );
+  let centerOfMass = remainingMoment / remainingMass;
+  let displacement = centerOfMass - targetParticle.positionMass.xyz;
+  let softeningSquared = 0.5 * (
+    targetSofteningSquared + remainingSofteningMoment / remainingMass
+  );
+  let distanceSquared = dot(displacement, displacement) + softeningSquared;
+  let inverseDistance = inverseSqrt(distanceSquared);
+  return parameters.gravity * remainingMass * displacement *
+    inverseDistance * inverseDistance * inverseDistance;
+}
+
 fn unpackCell(packedCell: u32) -> vec3u {
   return vec3u(
     packedCell & 0x1ffu,
@@ -382,8 +463,10 @@ fn overlapsExactNearField(node: TreeNode, targetCell: vec3u) -> bool {
 
 @compute @workgroup_size(${WORKGROUP_SIZE})
 fn calculateTreeForces(@builtin(global_invocation_id) globalId: vec3u) {
-  let targetIndex = globalId.x;
-  if (targetIndex >= parameters.particleCount) { return; }
+  let activeOrdinal = globalId.x;
+  let activeCount = min(adaptiveControl[1], parameters.particleCount);
+  if (activeOrdinal >= activeCount) { return; }
+  let targetIndex = activeIndices[activeOrdinal];
   let targetParticle = particles[targetIndex];
   if (targetParticle.positionMass.w <= 0.0) {
     accelerations[targetIndex] = vec4f(0.0);
@@ -424,6 +507,11 @@ fn calculateTreeForces(@builtin(global_invocation_id) globalId: vec3u) {
     if (depth == TREE_DEPTH) {
       if (accept) {
         acceleration += monopoleAcceleration(targetParticle, node);
+      } else if (containsTarget && node.parent > DENSE_LEAF_DIRECT_LIMIT) {
+        // An unresolved close cluster must not turn into an O(k^2) hotspot.
+        // At this occupancy the entire terminal cell is below the tree's
+        // spatial resolution, so use its softened monopole with self removed.
+        acceleration += monopoleAccelerationExcludingTarget(targetParticle, node);
       } else {
         acceleration += exactLeafAcceleration(targetIndex, targetParticle, current);
       }
@@ -434,7 +522,7 @@ fn calculateTreeForces(@builtin(global_invocation_id) globalId: vec3u) {
       continue;
     }
     for (var reverseSlot = 8u; reverseSlot > 0u; reverseSlot--) {
-      let child = atomicLoad(&nodeChildren[current * 8u + reverseSlot - 1u]);
+      let child = nodeChildren[current * 8u + reverseSlot - 1u];
       if (child != EMPTY && stackSize < 64u) {
         stack[stackSize] = child;
         stackSize++;
@@ -450,6 +538,9 @@ export const createBarnesHutSolver: GalaxySolverFactory = async ({
   initial,
   stateBuffers,
   accelerationBuffer,
+  activeIndicesBuffer,
+  adaptiveControlBuffer,
+  indirectDispatchBuffer,
 }) => {
   const particleCount = initial.parameters.particleCount;
   const treeDepth = chooseTreeDepth(particleCount);
@@ -481,11 +572,12 @@ export const createBarnesHutSolver: GalaxySolverFactory = async ({
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
-      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
-      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+      { binding: 7, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+      { binding: 8, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
     ],
   });
   const buildPipelineLayout = device.createPipelineLayout({ bindGroupLayouts: [buildLayout] });
@@ -493,18 +585,20 @@ export const createBarnesHutSolver: GalaxySolverFactory = async ({
   const buildEntries = [
     ["Reset", "resetBuild"],
     ["Bounds", "measureBounds"],
+    ["Finalize bounds", "finalizeBounds"],
     ["Claim level", "claimTreeLevel"],
-    ["Finalize level", "finalizeTreeLevel"],
-    ["Publish topology", "publishTreeTopology"],
+    ["Allocate level", "finalizeTreeLevel"],
+    ["Resolve level", "resolveTreeLevel"],
     ["Link leaves", "linkLeafParticles"],
     ["Aggregate level", "aggregateTreeLevel"],
   ] as const;
   const [
     resetPipeline,
     boundsPipeline,
+    finalizeBoundsPipeline,
     claimLevelPipeline,
-    finalizeLevelPipeline,
-    publishTopologyPipeline,
+    allocateLevelPipeline,
+    resolveLevelPipeline,
     linkLeavesPipeline,
     aggregatePipeline,
   ] = await Promise.all(buildEntries.map(([label, entryPoint]) =>
@@ -594,34 +688,43 @@ export const createBarnesHutSolver: GalaxySolverFactory = async ({
         { binding: 3, resource: { buffer: childBuffer } },
         { binding: 4, resource: { buffer: leafHeadBuffer } },
         { binding: 5, resource: { buffer: particleNextBuffer } },
-        { binding: 6, resource: { buffer: controlBuffer } },
-        { binding: 7, resource: { buffer: parameterBuffers[0]! } },
+        { binding: 6, resource: { buffer: activeIndicesBuffer } },
+        { binding: 7, resource: { buffer: adaptiveControlBuffer } },
+        { binding: 8, resource: { buffer: parameterBuffers[0]! } },
       ],
     }));
 
   const particleWorkgroups = Math.ceil(particleCount / WORKGROUP_SIZE);
+  let topologyAge = FULL_TREE_REBUILD_INTERVAL;
 
   return {
     kind: "barnes-hut",
     encode: (encoder, sourceIndex) => {
       const pass = encoder.beginComputePass({ label: "Compact Barnes-Hut pass" });
       pass.setBindGroup(0, buildBindGroups[sourceIndex]![0]!);
-      pass.setPipeline(resetPipeline!);
-      pass.dispatchWorkgroups(1);
-      pass.setPipeline(boundsPipeline!);
-      pass.dispatchWorkgroups(particleWorkgroups);
-      for (let level = 1; level <= treeDepth; level++) {
-        pass.setBindGroup(0, buildBindGroups[sourceIndex]![level]!);
-        pass.setPipeline(claimLevelPipeline!);
+      const rebuildTopology = topologyAge >= FULL_TREE_REBUILD_INTERVAL;
+      if (rebuildTopology) {
+        pass.setPipeline(resetPipeline!);
+        pass.dispatchWorkgroups(1);
+        pass.setPipeline(boundsPipeline!);
         pass.dispatchWorkgroups(particleWorkgroups);
-        pass.setPipeline(finalizeLevelPipeline!);
+        pass.setPipeline(finalizeBoundsPipeline!);
+        pass.dispatchWorkgroups(1);
+        for (let level = 1; level <= treeDepth; level++) {
+          pass.setBindGroup(0, buildBindGroups[sourceIndex]![level]!);
+          pass.setPipeline(claimLevelPipeline!);
+          pass.dispatchWorkgroups(particleWorkgroups);
+          pass.setPipeline(allocateLevelPipeline!);
+          pass.dispatchWorkgroups(particleWorkgroups);
+          pass.setPipeline(resolveLevelPipeline!);
+          pass.dispatchWorkgroups(particleWorkgroups);
+        }
+        pass.setBindGroup(0, buildBindGroups[sourceIndex]![0]!);
+        pass.setPipeline(linkLeavesPipeline!);
         pass.dispatchWorkgroups(particleWorkgroups);
+        topologyAge = 0;
       }
       pass.setBindGroup(0, buildBindGroups[sourceIndex]![0]!);
-      pass.setPipeline(publishTopologyPipeline!);
-      pass.dispatchWorkgroups(particleWorkgroups);
-      pass.setPipeline(linkLeavesPipeline!);
-      pass.dispatchWorkgroups(particleWorkgroups);
       pass.setPipeline(aggregatePipeline!);
       for (let level = treeDepth; level >= 0; level--) {
         pass.setBindGroup(0, buildBindGroups[sourceIndex]![level]!);
@@ -629,8 +732,9 @@ export const createBarnesHutSolver: GalaxySolverFactory = async ({
       }
       pass.setBindGroup(0, forceBindGroups[sourceIndex]!);
       pass.setPipeline(forcePipeline);
-      pass.dispatchWorkgroups(particleWorkgroups);
+      pass.dispatchWorkgroupsIndirect(indirectDispatchBuffer, 0);
       pass.end();
+      topologyAge++;
     },
     destroy: () => {
       [
