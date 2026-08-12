@@ -111,6 +111,7 @@ export const initGalaxyControls = () => {
   const solverButtons = Array.from(
     document.querySelectorAll<HTMLButtonElement>("[data-galaxy-solver]"),
   );
+  if (slider) slider.dataset.solverRisk = "all-pairs";
 
   // PAUSE BUTTON LOGIC
   // Check for 'data-loaded' to prevent attaching the click event twice
@@ -169,6 +170,7 @@ export const initGalaxyControls = () => {
         );
       }
       slider.max = String(definition.maxTextureWidth);
+      slider.dataset.solverRisk = solver;
       const width = Math.min(Number(slider.value), definition.maxTextureWidth);
       slider.value = String(width);
       if (sliderVal) sliderVal.textContent = `${width}x${width}`;

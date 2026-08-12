@@ -1,5 +1,5 @@
 ---
-const description = "A real-time galaxy merger simulation with live stellar disks, dark-matter halos, and compact cores. The WebGPU engine supports exact all-pairs gravity and a compact Barnes-Hut octree, then advances the encounter with leapfrog integration.";
+const description = "A live galaxy merger that turns millions of interacting particles into tidal tails, halo wakes, and a changing three-dimensional remnant. WebGPU keeps simulation state on the graphics card, where custom WGSL compute pipelines, compact buffers, indirect dispatch, and selectable all-pairs or Barnes-Hut gravity provide direct control over memory, scheduling, and force calculation.";
 ---
 
 <!doctype html>
@@ -59,6 +59,13 @@ const description = "A real-time galaxy merger simulation with live stellar disk
       .settings { display: grid; gap: 16px; }
       .setting-row, label { display: grid; grid-template-columns: 1fr auto; gap: 9px; color: #c7bdcd; font-size: 0.83rem; }
       input { grid-column: 1 / -1; width: 100%; accent-color: #b48bc8; }
+      #galaxy-stars-slider { height: 4px; border-radius: 999px; appearance: none; }
+      #galaxy-stars-slider[data-solver-risk="all-pairs"] {
+        background: linear-gradient(to right, #55475f 0%, #55475f 56.25%, rgba(239,68,68,.34) 56.25%, rgba(239,68,68,.9) 100%);
+      }
+      #galaxy-stars-slider[data-solver-risk="barnes-hut"] {
+        background: linear-gradient(to right, #55475f 0%, #55475f 20.66%, rgba(239,68,68,.34) 20.66%, rgba(239,68,68,.48) 47.11%, rgba(239,68,68,.95) 47.11%, rgba(239,68,68,.95) 100%);
+      }
       output { color: #eadff0; }
       .pause {
         width: 34px;
@@ -120,7 +127,7 @@ const description = "A real-time galaxy merger simulation with live stellar disk
           <label>
             Particle Count
             <output id="galaxy-stars-value">72x72</output>
-            <input type="range" id="galaxy-stars-slider" min="56" max="160" step="8" value="72" />
+            <input type="range" id="galaxy-stars-slider" min="56" max="184" step="8" value="72" />
           </label>
           <label>
             Disk Radius
@@ -171,4 +178,3 @@ const description = "A real-time galaxy merger simulation with live stellar disk
     </script>
   </body>
 </html>
-

@@ -50,8 +50,8 @@ describe("approximate solver mathematics", () => {
 
   it("keeps every million-body tree buffer below 256 MiB", () => {
     const memory = calculateBarnesHutMemoryLayout(1024 ** 2);
-    expect(memory.depth).toBe(9);
-    expect(memory.maximumNodes).toBeLessThan(7 * 1024 ** 2);
+    expect(memory.depth).toBe(10);
+    expect(memory.maximumNodes).toBeLessThan(5 * 1024 ** 2);
     expect(memory.largestBufferBytes).toBeLessThanOrEqual(256 * 2 ** 20);
     expect(memory.totalBytes).toBeLessThan(512 * 2 ** 20);
   });

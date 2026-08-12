@@ -8,7 +8,8 @@ describe("adaptive block timesteps", () => {
   it("quantizes local acceleration criteria into power-of-two intervals", () => {
     expect(choosePowerOfTwoInterval(100, 1, 0.08)).toBe(1);
     expect(choosePowerOfTwoInterval(1, 2, 0.08)).toBe(2);
-    expect(choosePowerOfTwoInterval(0.01, 2, 0.08)).toBe(MAX_TIME_INTERVAL);
+    expect(choosePowerOfTwoInterval(0.01, 2, 0.08)).toBe(32);
+    expect(choosePowerOfTwoInterval(1e-8, 2, 0.08)).toBe(MAX_TIME_INTERVAL);
   });
 
   it("never returns an interval outside the synchronization hierarchy", () => {

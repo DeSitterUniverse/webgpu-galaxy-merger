@@ -1,9 +1,10 @@
 import { WORKGROUP_SIZE } from "./galaxyShaders";
 
 // The configuration-derived timestep remains the smallest legal step. Slowly
-// varying particles can skip force evaluations for as many as 16 base ticks.
-// Keeping the hierarchy shallow avoids long extrapolations of halo orbits.
-export const MAX_TIME_BIN = 4;
+// varying particles can skip force evaluations for as many as 256 base ticks.
+// Active indices are compacted before the indirect force dispatch, so deep
+// bins reduce work without leaving mostly idle workgroups in the force pass.
+export const MAX_TIME_BIN = 8;
 export const MAX_TIME_INTERVAL = 1 << MAX_TIME_BIN;
 export const TIMESTEP_ETA = 0.025;
 export const TIMESTEP_STATE_BYTES = 16;

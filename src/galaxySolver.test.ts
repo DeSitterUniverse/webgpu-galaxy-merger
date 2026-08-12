@@ -4,7 +4,7 @@ import { GALAXY_SOLVERS } from "./galaxySolver";
 
 describe("galaxy solver selection", () => {
   it("keeps all-pairs bounded while exposing the million-body tree ceiling", () => {
-    expect(GALAXY_SOLVERS["all-pairs"].maxTextureWidth).toBe(160);
+    expect(GALAXY_SOLVERS["all-pairs"].maxTextureWidth).toBe(184);
     expect(GALAXY_SOLVERS["barnes-hut"].maxTextureWidth).toBe(1024);
   });
 

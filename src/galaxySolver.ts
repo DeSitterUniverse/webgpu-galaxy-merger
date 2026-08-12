@@ -14,7 +14,7 @@ export const GALAXY_SOLVERS: Record<GalaxySolverKind, GalaxySolverDefinition> = 
     kind: "all-pairs",
     label: "All-Pairs",
     description: "Exact tiled O(n²) reference solver",
-    maxTextureWidth: 160,
+    maxTextureWidth: 184,
   },
   "barnes-hut": {
     kind: "barnes-hut",
