@@ -1,0 +1,174 @@
+---
+const description = "A real-time galaxy merger simulation with live stellar disks, dark-matter halos, and compact cores. The WebGPU engine supports exact all-pairs gravity and a compact Barnes-Hut octree, then advances the encounter with leapfrog integration.";
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width" />
+    <meta
+      name="description"
+      content="Real-time WebGPU N-body galaxy merger simulation"
+    />
+    <title>WebGPU Galaxy Merger</title>
+    <style is:global>
+      :root {
+        color-scheme: dark;
+        font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+        background: #050407;
+        color: #eee9f2;
+      }
+
+      * { box-sizing: border-box; }
+      body { min-height: 100vh; margin: 0; overflow: hidden; }
+      button, input { font: inherit; }
+      .hidden { display: none; }
+
+      #galaxy-canvas {
+        position: fixed;
+        inset: 0;
+        width: 100%;
+        height: 100%;
+        background: radial-gradient(circle at center, #100c16 0%, #050407 62%);
+      }
+
+      main {
+        position: relative;
+        z-index: 1;
+        display: grid;
+        min-height: 100vh;
+        align-items: end;
+        padding: clamp(20px, 4vw, 54px);
+        pointer-events: none;
+      }
+
+      .panel {
+        width: min(560px, 100%);
+        padding: clamp(20px, 3vw, 32px);
+        border: 1px solid rgba(202, 178, 219, 0.28);
+        border-radius: 18px;
+        background: rgba(8, 6, 11, 0.78);
+        box-shadow: 0 24px 80px rgba(0, 0, 0, 0.4);
+        backdrop-filter: blur(18px);
+        pointer-events: auto;
+      }
+
+      h1 { margin: 0 0 10px; font-size: clamp(1.8rem, 5vw, 3.3rem); line-height: 0.95; }
+      .description { max-width: 65ch; margin: 0 0 24px; color: #b9afc1; line-height: 1.55; }
+      .settings { display: grid; gap: 16px; }
+      .setting-row, label { display: grid; grid-template-columns: 1fr auto; gap: 9px; color: #c7bdcd; font-size: 0.83rem; }
+      input { grid-column: 1 / -1; width: 100%; accent-color: #b48bc8; }
+      output { color: #eadff0; }
+      .pause {
+        width: 34px;
+        height: 34px;
+        border: 1px solid #55475f;
+        border-radius: 7px;
+        background: #17121c;
+        color: #d9c5e3;
+        cursor: pointer;
+      }
+
+      fieldset { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin: 0; padding: 0; border: 0; }
+      legend { grid-column: 1 / -1; margin-bottom: 7px; color: #c7bdcd; font-size: 0.83rem; }
+      fieldset button {
+        padding: 9px;
+        border: 1px solid #46394e;
+        border-radius: 8px;
+        background: rgba(19, 15, 23, 0.86);
+        color: #a89dad;
+        cursor: pointer;
+      }
+      fieldset button[aria-pressed="true"] { border-color: #b48bc8; background: #2a2031; color: #f1e5f5; }
+      #galaxy-backend-status { color: #ffb4a8; font-size: 0.75rem; }
+      dl { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 4px 0 0; padding-top: 16px; border-top: 1px solid #2e2633; }
+      dl div { display: grid; gap: 5px; }
+      dt { color: #8e8494; font-size: 0.74rem; }
+      dd { margin: 0; color: #eadff0; }
+
+      @media (max-width: 600px) {
+        main { align-items: stretch; padding: 10px; }
+        .panel { align-self: end; max-height: calc(100vh - 20px); overflow: auto; }
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="galaxy-canvas" aria-hidden="true"></canvas>
+    <main>
+      <section class="panel" aria-labelledby="simulation-title">
+        <h1 id="simulation-title">WebGPU Galaxy Merger</h1>
+        <p class="description">{description}</p>
+
+        <div class="settings">
+          <div class="setting-row">
+            <span>Simulation State</span>
+            <button id="galaxy-pause-btn" class="pause" aria-label="Toggle Pause">
+              <span id="icon-pause">Ⅱ</span>
+              <span id="icon-play" class="hidden">▶</span>
+            </button>
+          </div>
+
+          <fieldset aria-label="Gravity solver">
+            <legend>Gravity Solver</legend>
+            <button type="button" data-galaxy-solver="all-pairs" aria-pressed="true">All-Pairs</button>
+            <button type="button" data-galaxy-solver="barnes-hut" aria-pressed="false">Barnes-Hut</button>
+          </fieldset>
+
+          <output id="galaxy-backend-status" aria-live="polite" hidden>Idle</output>
+
+          <label>
+            Particle Count
+            <output id="galaxy-stars-value">72x72</output>
+            <input type="range" id="galaxy-stars-slider" min="56" max="160" step="8" value="72" />
+          </label>
+          <label>
+            Disk Radius
+            <output id="galaxy-radius-value">35</output>
+            <input type="range" id="galaxy-radius-slider" min="15" max="80" step="1" value="35" />
+          </label>
+          <label>
+            Initial Center Offset
+            <output id="galaxy-offset-value">25</output>
+            <input type="range" id="galaxy-offset-slider" min="10" max="60" step="1" value="25" />
+          </label>
+
+          <dl aria-label="Live merger statistics">
+            <div>
+              <dt>Simulation Time</dt>
+              <dd><output id="galaxy-time-value">0.00</output></dd>
+            </div>
+            <div>
+              <dt>Core Separation</dt>
+              <dd><output id="galaxy-core-separation-value">—</output></dd>
+            </div>
+          </dl>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      import { initGalaxyControls } from "../galaxyControls";
+      import { initGalaxyEngine } from "../galaxyEngine";
+
+      let cleanup: (() => void) | undefined;
+
+      const startSimulation = () => {
+        initGalaxyControls();
+        cleanup ??= initGalaxyEngine();
+        window.dispatchEvent(
+          new CustomEvent("galaxy:visibility", { detail: { visible: true } }),
+        );
+      };
+
+      if (document.readyState === "loading") {
+        document.addEventListener("DOMContentLoaded", startSimulation, { once: true });
+      } else {
+        startSimulation();
+      }
+
+      window.addEventListener("beforeunload", () => cleanup?.(), { once: true });
+    </script>
+  </body>
+</html>
+
